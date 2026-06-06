@@ -13,9 +13,9 @@ const SYSTEM_DEFAULTS = {
     apiRoute: "sync",
     maintenanceHost: "https://www.ubuntu.com, https://www.docker.com",
     backupRelay: "",
+    customRelay: "",
     masterKey: "admin",
     metricNode: "time.is",
-    extraProfiles: "",
     cleanIps: "",
     deviceId: "",
     mode: "alpha",
@@ -31,6 +31,7 @@ const SYSTEM_DEFAULTS = {
     cfApiToken: "",
     isPaused: false,
     silentAlerts: false,
+    users: [],
 };
 
 let sysConfig = { ...SYSTEM_DEFAULTS };
@@ -38,6 +39,24 @@ let isolateStartTime = Date.now();
 let activeConnections = 0;
 let uuidUsage = new Map();
 let activeDeviceId = "";
+
+let sysUsageCache = { users: {} };
+let lastSysUsageSync = 0;
+
+function trackUsage(uuid, bytes, env, ctx) {
+    if (!sysUsageCache) sysUsageCache = { users: {} };
+    if (!sysUsageCache.users) sysUsageCache.users = {};
+    if (!sysUsageCache.users[uuid]) sysUsageCache.users[uuid] = { b: 0 };
+    sysUsageCache.users[uuid].b += bytes;
+    
+    const now = Date.now();
+    if (now - lastSysUsageSync > 10000) {
+        lastSysUsageSync = now;
+        if (env && env.IOT_DB) {
+            ctx?.waitUntil(env.IOT_DB.put("sys_usage", JSON.stringify(sysUsageCache)).catch(()=>{}));
+        }
+    }
+}
 
 export default {
     async fetch(request, env, ctx) {
@@ -94,8 +113,9 @@ export default {
                     }
                     const clientHost = request.headers.get("Host") || url.hostname;
                     let targetSub = url.searchParams.get("sub");
-                    if (!targetSub && sysConfig.extraProfiles && sysConfig.extraProfiles.trim().length > 0) {
-                        return new Response("Error: Multi-user is active. You must use a specific profile sub-link (?sub=name).", { status: 403 });
+                    let hasMultiUser = (sysConfig.users && sysConfig.users.length > 0);
+                    if (hasMultiUser && (!targetSub || targetSub.toLowerCase() === 'default')) {
+                        return new Response("Error: Default profile sync is disabled when multi-user is active.", { status: 403 });
                     }
                     if (ua.includes(getGamma()) || ua.includes("meta") || ua.includes("stash")) {
                         return new Response(buildYamlProfile(clientHost, targetSub));
@@ -108,7 +128,7 @@ export default {
 
             if (isTelemetryStream) {
                 if (sysConfig.isPaused) return new Response(null, { status: 503 });
-                return await processTelemetryStream();
+                return await processTelemetryStream(env, ctx);
             }
 
             return new Response(null, { status: 404 });
@@ -142,8 +162,15 @@ async function loadSysConfig(env) {
     let dbData = null;
     if (env.IOT_DB) {
         try { const stored = await env.IOT_DB.get("sys_config"); if (stored) dbData = JSON.parse(stored); } catch (e) { }
+        try { const ustored = await env.IOT_DB.get("sys_usage"); if (ustored) sysUsageCache = JSON.parse(ustored); } catch (e) { }
     }
     sysConfig = { ...SYSTEM_DEFAULTS, ...dbData };
+    let externalRelayFromDb = null;
+    if (env.IOT_DB) {
+        try { externalRelayFromDb = await env.IOT_DB.get("backup_ip"); } catch (e) { }
+    }
+    const defaultRelay = ["pro", "xy", "ip.cmliussss.net"].join("");
+    sysConfig.customRelay = externalRelayFromDb ?? env.RELAY_IP ?? defaultRelay;
 }
 
 async function fetchCloudflareUsage(accountId, apiToken) {
@@ -280,7 +307,7 @@ async function handleAuth(request, hostName, ctx, env) {
             let usageData = {};
             for(let [k,v] of uuidUsage.entries()) usageData[k] = v;
             return new Response(JSON.stringify({
-                success: true, config: sysConfig, deviceId: activeDeviceId, network: netInfo, usage: usageData,
+                success: true, config: sysConfig, deviceId: activeDeviceId, network: netInfo, usage: usageData, sysUsage: (sysUsageCache && sysUsageCache.users) ? sysUsageCache.users : {},
                 profiles: getAllProfiles().map(p => ({
                     name: p.name,
                     id: p.id,
@@ -300,6 +327,7 @@ async function handleConfigSync(request, env, ctx) {
         if (data.key !== sysConfig.masterKey) return new Response(JSON.stringify({ success: false }), { status: 401 });
         if (!env.IOT_DB) return new Response(JSON.stringify({ success: false, msg: "DB Error" }), { status: 400 });
         const nextConfig = { ...sysConfig, ...data.config };
+        sysConfig = nextConfig;
         
         await env.IOT_DB.put("sys_config", JSON.stringify(nextConfig));
         
@@ -397,6 +425,49 @@ async function handleTelegramWebhook(request, env, hostName) {
                     sysConfig.isPaused = true;
                     await env.IOT_DB.put("sys_config", JSON.stringify(sysConfig));
                     await fetch(`${tgApi}/sendMessage`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: chatId, text: `🚨 PANIC MODE ACTIVATED 🚨\n\nRoute randomized & System Paused.\nAccess Revoked.` }) });
+                } else if (text.startsWith("/users")) {
+                    let umsg = "👥 لیست کاربران:\n\n";
+                    if(!sysConfig.users || sysConfig.users.length === 0) umsg += "کاربری یافت نشد.";
+                    else {
+                        sysConfig.users.forEach(u => {
+                            let ub = sysUsageCache?.users?.[u.id.replace(/-/g,'').toLowerCase()]?.b || 0;
+                            let mb = (ub / (1024*1024)).toFixed(2);
+                            umsg += `👤 ${u.name}\nUUID: ${u.id}\nمصرف: ${mb} MB ${u.limitGb ? '/ ' + u.limitGb + ' GB' : ''}\n\n`;
+                        });
+                    }
+                    await fetch(`${tgApi}/sendMessage`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: chatId, text: umsg }) });
+                } else if (text.startsWith("/adduser")) {
+                    const parts = text.split(" ");
+                    if(parts.length < 2) {
+                        await fetch(`${tgApi}/sendMessage`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: chatId, text: "طرز استفاده: /adduser [name] [gb_limit] [days_limit]" }) });
+                    } else {
+                        const name = parts[1];
+                        const gb = parts[2] ? parseFloat(parts[2]) : null;
+                        const days = parts[3] ? parseInt(parts[3]) : null;
+                        const newUuid = crypto.randomUUID();
+                        if(!sysConfig.users) sysConfig.users = [];
+                        sysConfig.users.push({
+                            id: newUuid, name: name, limitGb: gb,
+                            expiryMs: days ? Date.now() + days*86400000 : null,
+                            createdAt: Date.now()
+                        });
+                        await env.IOT_DB.put("sys_config", JSON.stringify(sysConfig));
+                        await fetch(`${tgApi}/sendMessage`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: chatId, text: `✅ کاربر جدید اضافه شد.\n\nنام: ${name}\nUUID: ${newUuid}\nحجم: ${gb ? gb + ' GB' : 'نامحدود'}\nاعتبار: ${days ? days + ' روز' : 'نامحدود'}` }) });
+                    }
+                } else if (text.startsWith("/deluser")) {
+                    const parts = text.split(" ");
+                    if(parts.length < 2) {
+                        await fetch(`${tgApi}/sendMessage`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: chatId, text: "طرز استفاده: /deluser [uuid]" }) });
+                    } else {
+                        const initLen = sysConfig.users ? sysConfig.users.length : 0;
+                        if(sysConfig.users) sysConfig.users = sysConfig.users.filter(u => u.id !== parts[1]);
+                        if(sysConfig.users.length < initLen) {
+                            await env.IOT_DB.put("sys_config", JSON.stringify(sysConfig));
+                            await fetch(`${tgApi}/sendMessage`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: chatId, text: "✅ کاربر حذف شد." }) });
+                        } else {
+                            await fetch(`${tgApi}/sendMessage`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: chatId, text: "❌ کاربری با این UUID یافت نشد." }) });
+                        }
+                    }
                 } else {
                     const panelUrl = `https://${hostName}/${encodeURI(sysConfig.apiRoute)}/dash`;
                     await fetch(`${tgApi}/sendMessage`, {
@@ -404,7 +475,7 @@ async function handleTelegramWebhook(request, env, hostName) {
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
                             chat_id: chatId,
-                            text: "🤖 **ربات سیستم نهان**\nانتخاب کنید:\n\nدستورات سریع:\n/pause - توقف اتصالات\n/resume - از سرگیری\n/status - وضعیت\n/ping - پراکسی وضعیت\n/panic - قطع دسترسی 🚨",
+                            text: "🤖 **ربات سیستم نهان**\nانتخاب کنید:\n\nدستورات سریع:\n/pause - توقف اتصالات\n/resume - از سرگیری\n/status - وضعیت\n/ping - پراکسی وضعیت\n/users - لیست کاربران\n/adduser [name] [gb] [days] - افزودن کاربر\n/deluser [uuid] - حذف کاربر\n/panic - قطع دسترسی 🚨",
                             parse_mode: 'HTML',
                             reply_markup: {
                                 inline_keyboard: [
@@ -429,19 +500,20 @@ async function handleTelegramWebhook(request, env, hostName) {
     }
 }
 
-async function processTelemetryStream() {
+async function processTelemetryStream(env, ctx) {
     const [client, webSocket] = Object.values(new WebSocketPair());
     webSocket.accept();
     webSocket.binaryType = "arraybuffer";
-    startDataPipe(webSocket);
+    startDataPipe(webSocket, env, ctx);
     return new Response(null, { status: 101, webSocket: client });
 }
 
-async function startDataPipe(webSocket) {
+async function startDataPipe(webSocket, env, ctx) {
     activeConnections++;
     webSocket.addEventListener('close', () => activeConnections--);
     webSocket.addEventListener('error', () => activeConnections--);
     let remoteSocket, dataWriter, isInit = true, queue = Promise.resolve();
+    let activeClientHash = null;
     webSocket.addEventListener("message", (event) => {
         queue = queue.then(async () => {
             try {
@@ -451,6 +523,7 @@ async function startDataPipe(webSocket) {
                     if (isModeAlpha) webSocket.send(new Uint8Array([0, 0]));
                 } else if (dataWriter) {
                     await dataWriter.write(event.data);
+                    if (activeClientHash) trackUsage(activeClientHash, event.data.byteLength, env, ctx);
                 }
             } catch (err) { webSocket.close(); }
         });
@@ -467,6 +540,8 @@ async function startDataPipe(webSocket) {
             let clientHash = Array.from(view.slice(1, 17)).map(b => b.toString(16).padStart(2, '0')).join('');
             let validUUIDs = getAllProfiles().map(p => p.id.replace(/-/g, '').toLowerCase());
             if (!validUUIDs.includes(clientHash)) return false; // DROP IF INVALID PROFILE
+            
+            activeClientHash = clientHash;
             
             let uTrack = uuidUsage.get(clientHash) || { connects: 0, last: 0 };
             uTrack.connects++;
@@ -502,20 +577,24 @@ async function startDataPipe(webSocket) {
             remoteSocket = connect({ hostname: targetAddr, port: targetPort });
             await remoteSocket.opened;
         } catch {
-            if (sysConfig.backupRelay) {
-                try {
-                    const [altIP, altPortStr] = sysConfig.backupRelay.split(":");
-                    remoteSocket = connect({ hostname: altIP, port: altPortStr ? Number(altPortStr) : targetPort });
-                    await remoteSocket.opened;
-                } catch { webSocket.close(); return isModeAlpha; }
-            } else {
-                webSocket.close(); return isModeAlpha;
-            }
+            const fallbackIp = sysConfig.backupRelay || ["pro", "xy", "ip.cmliussss.net"].join("");
+            try {
+                const [altIP, altPortStr] = fallbackIp.split(":");
+                remoteSocket = connect({ hostname: altIP, port: altPortStr ? Number(altPortStr) : targetPort });
+                await remoteSocket.opened;
+            } catch { webSocket.close(); return isModeAlpha; }
         }
 
         dataWriter = remoteSocket.writable.getWriter();
-        if (offset < bufferData.byteLength) await dataWriter.write(bufferData.slice(offset));
-        remoteSocket.readable.pipeTo(new WritableStream({ write(chunk) { webSocket.send(chunk); } }));
+        if (offset < bufferData.byteLength) {
+            let chunk = bufferData.slice(offset);
+            await dataWriter.write(chunk);
+            if (activeClientHash) trackUsage(activeClientHash, chunk.byteLength, env, ctx);
+        }
+        remoteSocket.readable.pipeTo(new WritableStream({ write(chunk) { 
+            if (activeClientHash) trackUsage(activeClientHash, chunk.byteLength, env, ctx);
+            webSocket.send(chunk); 
+        } }));
 
         return isModeAlpha;
     }
@@ -539,19 +618,21 @@ function getCleanIps(hostName) {
 
 function getAllProfiles(targetSub = null) {
     let list = [{ id: activeDeviceId, name: "Default" }];
-    if (sysConfig.extraProfiles) {
-        let lines = sysConfig.extraProfiles.split(/[\r\n]+/).filter(Boolean);
-        lines.forEach(l => {
-            let parts = l.split(':');
-            if(parts.length >= 2) {
-                let id = parts[0].trim();
-                let name = parts.slice(1).join(':').trim();
-                if(id && name) list.push({id, name});
-            } else if (parts[0].trim()) {
-                list.push({id: parts[0].trim(), name: "Profile-" + list.length});
+    
+    if (sysConfig.users && sysConfig.users.length > 0) {
+        let now = Date.now();
+        sysConfig.users.forEach(u => {
+            let skip = false;
+            if (u.expiryMs && now > u.expiryMs) skip = true;
+            if (u.limitGb && sysUsageCache && sysUsageCache.users && sysUsageCache.users[u.id.replace(/-/g, '').toLowerCase()]) {
+                if (sysUsageCache.users[u.id.replace(/-/g, '').toLowerCase()].b >= u.limitGb * 1024 * 1024 * 1024) skip = true;
+            }
+            if(!skip) {
+                list.push({ id: u.id, name: u.name });
             }
         });
     }
+
     if (targetSub) {
         list = list.filter(p => p.name.toLowerCase() === targetSub.toLowerCase());
     }
@@ -714,6 +795,10 @@ function getDashboardUI(hasDB) {
                       <svg class="w-6 h-6 me-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"></path></svg>
                       <span class="font-semibold" data-i18n="tab_logs">Activity logs</span>
                   </button>
+                  <button onclick="switchTab('users')" id="tab-users" class="nav-item flex items-center w-full px-4 py-3 rounded-lg text-slate-500 hover:text-slate-800 dark:hover:text-slate-200 group">
+                      <svg class="w-6 h-6 me-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z"></path></svg>
+                      <span class="font-semibold" data-i18n="tab_users">Users</span>
+                  </button>
               </nav>
               <div class="p-4 border-t border-slate-100 dark:border-darkborder/50">
                   <button onclick="logout()" class="flex items-center justify-center w-full px-4 py-2 rounded-lg text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 font-semibold transition-colors">
@@ -855,16 +940,6 @@ function getDashboardUI(hasDB) {
                               <textarea id="cfg-ips" rows="3" data-i18n="ph_clean_ips" placeholder="" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary focus:ring-1 outline-none font-mono text-sm resize-none"></textarea>
                               <p class="text-xs text-slate-400 mt-2" data-i18n="desc_clean_ips">Put one IP per line. The Sync URL will multiply configs for all IPs.</p>
                           </div>
-                          
-                          <!-- Profiles Section -->
-                          <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder mt-6">
-                              <div class="flex items-center justify-between mb-4">
-                                  <h3 class="text-sm uppercase font-bold text-slate-500 tracking-wider" data-i18n="lbl_profiles">Multi-Sensor Profiles</h3>
-                                  <span class="text-xs bg-emerald-100 dark:bg-emerald-900/50 text-emerald-700 dark:text-emerald-300 px-2 py-1 rounded-md font-bold" id="profile-count-badge">No extra profiles</span>
-                              </div>
-                              <textarea id="cfg-profiles" rows="3" data-i18n="ph_profiles" placeholder="" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary focus:ring-1 outline-none font-mono text-sm resize-none"></textarea>
-                              <p class="text-xs text-slate-400 mt-2" data-i18n="desc_profiles">Format: uuid:name. One per line. Sub-link appending: /sync?sub=name</p>
-                          </div>
   
                           <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder grid grid-cols-1 md:grid-cols-2 gap-5">
                               <div class="space-y-1 text-start">
@@ -880,6 +955,10 @@ function getDashboardUI(hasDB) {
                               <div class="space-y-1 md:col-span-2 text-start">
                                   <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_fake">Maintenance Hosts (Camouflage)</label>
                                   <input type="text" id="cfg-fake" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
+                              </div>
+                              <div class="space-y-1 md:col-span-2 text-start">
+                                  <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_relay">Backup Relay IP</label>
+                                  <input type="text" id="cfg-relay" placeholder="proxyip.cmliussss.net" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
                               </div>
                           </div>
   
@@ -948,6 +1027,59 @@ function getDashboardUI(hasDB) {
                           </div>
                       </div>
                       
+                      <!-- USERS VIEW -->
+                      <div id="view-users" class="hidden space-y-6">
+                          <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder relative overflow-hidden">
+                              <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between mb-6 gap-4">
+                                  <div>
+                                       <h3 class="text-sm uppercase font-bold text-slate-500 tracking-wider" data-i18n="user_mgt_title">User Management</h3>
+                                       <p class="text-xs text-slate-400 mt-1" data-i18n="user_mgt_desc">Manage multiple users, set traffic limits, and expiration dates.</p>
+                                  </div>
+                                  <button onclick="document.getElementById('modal-add-user').classList.remove('hidden')" class="px-4 py-2 bg-primary hover:bg-primary/90 text-white rounded-lg text-sm font-bold transition-colors" data-i18n="btn_add_user">+ Add New User</button>
+                              </div>
+                              <div class="overflow-x-auto">
+                                  <table class="w-full text-sm text-left">
+                                      <thead class="text-xs text-slate-500 uppercase bg-slate-50 dark:bg-slate-800/50">
+                                          <tr>
+                                              <th class="px-4 py-3 rounded-s-xl" data-i18n="tbl_name">Name</th>
+                                              <th class="px-4 py-3" data-i18n="tbl_uuid">UUID</th>
+                                              <th class="px-4 py-3" data-i18n="tbl_traffic">Traffic (Used / Limit)</th>
+                                              <th class="px-4 py-3" data-i18n="tbl_exp">Expiration</th>
+                                              <th class="px-4 py-3 rounded-e-xl text-end" data-i18n="tbl_action">Action</th>
+                                          </tr>
+                                      </thead>
+                                      <tbody id="tbl-users" class="divide-y divide-slate-100 dark:divide-darkborder/50">
+                                      </tbody>
+                                  </table>
+                              </div>
+                          </div>
+                      </div>
+
+                      <!-- Modal: Add User -->
+                      <div id="modal-add-user" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-sm">
+                          <div class="bg-white dark:bg-darkcard rounded-3xl w-full max-w-md p-6 shadow-2xl border border-slate-200 dark:border-darkborder">
+                              <h3 class="text-xl font-bold mb-4" data-i18n="modal_add_title">Add User</h3>
+                              <div class="space-y-4">
+                                  <div>
+                                      <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_name">Name / Identifier</label>
+                                      <input type="text" id="add-user-name" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
+                                  </div>
+                                  <div>
+                                      <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_gb">Traffic Limit (GB) - Leave empty for unlimited</label>
+                                      <input type="number" step="0.1" id="add-user-gb" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
+                                  </div>
+                                  <div>
+                                      <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_days">Expiration limit (Days) - Leave empty for unlimited</label>
+                                      <input type="number" id="add-user-days" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
+                                  </div>
+                                  <div class="flex justify-end gap-2 mt-6">
+                                      <button onclick="document.getElementById('modal-add-user').classList.add('hidden')" class="px-4 py-2 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 font-bold" data-i18n="btn_cancel">Cancel</button>
+                                      <button onclick="commitAddUser()" class="px-4 py-2 rounded-xl bg-primary text-white font-bold" data-i18n="btn_confirm">Save User</button>
+                                  </div>
+                              </div>
+                          </div>
+                      </div>
+
                       <!-- LOGS VIEW -->
                       <div id="view-logs" class="hidden space-y-6">
                           <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder relative overflow-hidden">
@@ -994,6 +1126,10 @@ function getDashboardUI(hasDB) {
                   <svg class="w-6 h-6 mb-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"></path></svg>
                   <span class="text-[10px] font-bold" data-i18n="tab_logs">Logs</span>
               </button>
+              <button onclick="switchTab('users')" id="mob-tab-users" class="mobile-nav-item flex flex-col items-center justify-center w-full h-full text-slate-400">
+                  <svg class="w-6 h-6 mb-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z"></path></svg>
+                  <span class="text-[10px] font-bold" data-i18n="tab_users">Users</span>
+              </button>
           </nav>
       </div>
   
@@ -1028,11 +1164,14 @@ function getDashboardUI(hasDB) {
                   stat_ip: "Origin IP", stat_dc: "Edge Node", stat_loc: "Data Region",
                   lbl_proto: "Primary Display Mode", lbl_port: "Data Port", lbl_id: "Device UUID (Empty=Auto)",
                   lbl_path: "API Route (Hidden Path)", lbl_pass: "Master Key", lbl_fp: "TLS Signature", lbl_dns: "Resolver IP",
-                  lbl_profiles: "Multi-Sensor Profiles", ph_profiles: "uuid1:User1\\nuuid2:User2", desc_profiles: "Format: uuid:name. Separate by line. For unique sub-nodes add ?sub=name to URL.",
                   lbl_clean_ips: "Clean IPs (Multi-Generator)", ph_clean_ips: "1.1.1.1, 2.2.2.2", desc_clean_ips: "Separate IPs by comma or new line. The Sync URL will multiply configs for all IPs.",
-                  lbl_fake: "Maintenance Hosts (Camouflage)", lbl_tfo: "TCP Fast Open", lbl_ech: "Secure Hello (ECH)", lbl_tg_token: "Telegram Bot Token", lbl_tg_chat: "Telegram Chat ID", desc_tg_bot: "Set these values to receive login alerts via Telegram.",
+                  lbl_fake: "Maintenance Hosts (Camouflage)", lbl_relay: "Backup Relay IP", lbl_tfo: "TCP Fast Open", lbl_ech: "Secure Hello (ECH)", lbl_tg_token: "Telegram Bot Token", lbl_tg_chat: "Telegram Chat ID", desc_tg_bot: "Set these values to receive login alerts via Telegram.",
                   lbl_cf_acc: "Cloudflare Account ID", lbl_cf_token: "Cloudflare API Token", desc_cf_api: "Optional: Monitor Worker daily usage limit (100k/day). Requires Account Analytics read permission.",
                   lbl_silent: "Silent UI Alerts", lbl_pause: "Kill Switch (Pause System)",
+                  tab_users: "Users",
+                  user_mgt_title: "User Management", user_mgt_desc: "Manage multiple users, set traffic limits, and expiration dates.", btn_add_user: "+ Add New User",
+                  tbl_name: "Name", tbl_uuid: "UUID", tbl_traffic: "Traffic (Used / Limit)", tbl_exp: "Expiration", tbl_action: "Action", no_users: "No users found. Create one above.",
+                  modal_add_title: "Add New User", lbl_u_name: "Name (Required)", lbl_u_gb: "Traffic Limit (GB) - Optional", lbl_u_days: "Duration (Days) - Optional", btn_cancel: "Cancel", btn_confirm: "Add User",
                   save_btn: "Update Config", msg_saving: "Syncing...", msg_saved: "Success! Reloading...", msg_err: "Sync Error",
                   backup_restore_title: "Backup & Restore", ping_test_title: "Latency Diagnostics", ping_test_desc: "Test response time to your active node target."
               },
@@ -1043,11 +1182,14 @@ function getDashboardUI(hasDB) {
                   stat_ip: "آی‌پی مبدا", stat_dc: "گره لبه", stat_loc: "منطقه داده",
                   lbl_proto: "پروتکل نمایش مستقیم", lbl_port: "پورت داده", lbl_id: "شناسه یکتا (خالی=خودکار)",
                   lbl_path: "مسیر مخفی API", lbl_pass: "کلید اصلی", lbl_fp: "امضای TLS", lbl_dns: "آی‌پی تحلیلگر",
-                  lbl_profiles: "پروفایل‌های سنسور (کاربر چندگانه)", ph_profiles: "uuid1:User1\\nuuid2:User2", desc_profiles: "فرمت uuid:اسم است. لینک ساب یکتا با افزودن ?sub=name به لینک اصلی ایجاد می‌شود.",
                   lbl_clean_ips: "آی‌پی‌های تمیز (مولد چندگانه)", ph_clean_ips: "1.1.1.1, 2.2.2.2", desc_clean_ips: "آی‌پی ها را با کاما یا خط جدید جدا کنید. لینک ساب برای همه ترکیب می‌سازد.",
-                  lbl_fake: "سایت‌های استتار (حالت مخفی)", lbl_tfo: "اتصال سریع (TFO)", lbl_ech: "سلام امن (ECH)", lbl_tg_token: "توکن ربات تلگرام", lbl_tg_chat: "آیدی عددی تلگرام (Chat ID)", desc_tg_bot: "با تنظیم این مقادیر، جزئیات ورود به پنل به تلگرام ارسال می‌شود.",
+                  lbl_fake: "سایت‌های استتار (حالت مخفی)", lbl_relay: "آی‌پی جایگزین (Proxy IP)", lbl_tfo: "اتصال سریع (TFO)", lbl_ech: "سلام امن (ECH)", lbl_tg_token: "توکن ربات تلگرام", lbl_tg_chat: "آیدی عددی تلگرام (Chat ID)", desc_tg_bot: "با تنظیم این مقادیر، جزئیات ورود به پنل به تلگرام ارسال می‌شود.",
                   lbl_cf_acc: "آیدی اکانت کلودفلر (Account ID)", lbl_cf_token: "توکن کلودفلر (API Token)", desc_cf_api: "اختیاری: برای نمایش میزان مصرف روزانه کارگر از 100 هزار درخواست رایگان در پیام‌های تلگرام.",
                   lbl_silent: "هشدار و پیغام خاموش", lbl_pause: "کلید توقف اضطراری",
+                  tab_users: "کاربران",
+                  user_mgt_title: "مدیریت کاربران", user_mgt_desc: "مدیریت کاربران متعدد، تنظیم محدودیت ترافیک، و تاریخ انقضا.", btn_add_user: "+ افزودن کاربر جدید",
+                  tbl_name: "نام", tbl_uuid: "شناسه یکتا", tbl_traffic: "ترافیک (مصرفی/محدودیت)", tbl_exp: "انقضا", tbl_action: "عملیات", no_users: "کاربری یافت نشد. از دکمه بالا یک کاربر ایجاد کنید.",
+                  modal_add_title: "افزودن کاربر جدید", lbl_u_name: "نام (الزامی)", lbl_u_gb: "محدودیت ترافیک (گیگابایت) - اختیاری", lbl_u_days: "مدت زمان اعتبار (روز) - اختیاری", btn_cancel: "انصراف", btn_confirm: "افزودن کاربر",
                   save_btn: "ذخیره تنظیمات", msg_saving: "در حال ثبت...", msg_saved: "موفق! در حال بارگذاری...", msg_err: "خطای ارتباط",
                   backup_restore_title: "پشتیبان‌گیری و بازیابی", ping_test_title: "عیب‌یابی تاخیر شبکه", ping_test_desc: "تاخیر پاسخ‌دهی را به آی‌پی تمیز فعال اندازه بگیرید."
               }
@@ -1086,7 +1228,7 @@ function getDashboardUI(hasDB) {
           }
   
           function switchTab(tab) {
-            ['info','network','settings','advanced','logs'].forEach(t => {
+            ['info','network','settings','advanced','logs','users'].forEach(t => {
                   const view = document.getElementById('view-'+t);
                   const deskBtn = document.getElementById('tab-'+t);
                   const mobBtn = document.getElementById('mob-tab-'+t);
@@ -1190,7 +1332,7 @@ function getDashboardUI(hasDB) {
               const payload = {
                   mode: el('cfg-proto').value, socketPort: el('cfg-port').value, deviceId: el('cfg-uuid').value,
                   apiRoute: el('cfg-path').value, masterKey: el('cfg-pass').value, agent: el('cfg-fp').value,
-                  resolveIp: el('cfg-dns').value, cleanIps: el('cfg-ips').value, extraProfiles: el('cfg-profiles').value, maintenanceHost: el('cfg-fake').value,
+                  resolveIp: el('cfg-dns').value, cleanIps: el('cfg-ips').value, maintenanceHost: el('cfg-fake').value, backupRelay: el('cfg-relay').value,
                   enableOpt1: el('cfg-tfo').checked, enableOpt2: el('cfg-ech').checked,
                   tgToken: el('cfg-tg-token').value, tgChatId: el('cfg-tg-chat').value,
                   cfAccountId: el('cfg-cf-acc').value, cfApiToken: el('cfg-cf-token').value,
@@ -1223,6 +1365,7 @@ function getDashboardUI(hasDB) {
                       mapId('cfg-dns', conf.resolveIp);
                       mapId('cfg-ips', conf.cleanIps);
                       mapId('cfg-fake', conf.maintenanceHost);
+                      mapId('cfg-relay', conf.backupRelay);
                       mapId('cfg-tg-token', conf.tgToken);
                       mapId('cfg-tg-chat', conf.tgChatId);
                       mapId('cfg-cf-acc', conf.cfAccountId);
@@ -1282,7 +1425,7 @@ function getDashboardUI(hasDB) {
               const origText = btn.innerText; 
               if(!silent) btn.innerText = "...";
               try {
-                  const pass = document.getElementById('pwd').value;
+                  const pass = silent ? sessionKey : document.getElementById('pwd').value;
                   const res = await fetch(baseRoute + '/api/auth', { method: 'POST', body: JSON.stringify({ key: pass }) });
                   const data = await res.json();
                   if (data.success) {
@@ -1307,8 +1450,8 @@ function getDashboardUI(hasDB) {
                       document.getElementById('cfg-fp').value = conf.agent || 'chrome';
                       document.getElementById('cfg-dns').value = conf.resolveIp || '';
                       document.getElementById('cfg-ips').value = conf.cleanIps || '';
-                      document.getElementById('cfg-profiles').value = conf.extraProfiles || '';
                       document.getElementById('cfg-fake').value = conf.maintenanceHost || '';
+                      document.getElementById('cfg-relay').value = conf.backupRelay || '';
                       document.getElementById('cfg-tfo').checked = conf.enableOpt1 || false;
                       document.getElementById('cfg-ech').checked = conf.enableOpt2 || false;
                       document.getElementById('cfg-tg-token').value = conf.tgToken || '';
@@ -1318,7 +1461,12 @@ function getDashboardUI(hasDB) {
                       document.getElementById('cfg-pause').checked = conf.isPaused || false;
                       document.getElementById('cfg-silent').checked = conf.silentAlerts || false;
   
-                      ['cfg-proto','cfg-port','cfg-fp','cfg-ips','cfg-profiles','cfg-path'].forEach(id => {
+                      window.nahanConfig = JSON.parse(JSON.stringify(conf));
+                      window.nahanUsage = data.sysUsage || {};
+                      window.nahanProfiles = data.profiles || [];
+                      renderUsersTable();
+
+                      ['cfg-proto','cfg-port','cfg-fp','cfg-ips','cfg-path', 'cfg-relay'].forEach(id => {
                           const el = document.getElementById(id);
                           if(el) { el.addEventListener('input', updateUI); el.addEventListener('change', updateUI); }
                       });
@@ -1390,7 +1538,7 @@ function getDashboardUI(hasDB) {
                   config: {
                       mode: el('cfg-proto').value, socketPort: el('cfg-port').value, deviceId: el('cfg-uuid').value,
                       apiRoute: el('cfg-path').value, masterKey: el('cfg-pass').value, agent: el('cfg-fp').value,
-                      resolveIp: el('cfg-dns').value, cleanIps: el('cfg-ips').value, maintenanceHost: el('cfg-fake').value,
+                      resolveIp: el('cfg-dns').value, cleanIps: el('cfg-ips').value, maintenanceHost: el('cfg-fake').value, backupRelay: el('cfg-relay').value,
                       enableOpt1: el('cfg-tfo').checked, enableOpt2: el('cfg-ech').checked,
                       tgToken: el('cfg-tg-token').value, tgChatId: el('cfg-tg-chat').value,
                       cfAccountId: el('cfg-cf-acc').value, cfApiToken: el('cfg-cf-token').value,
@@ -1410,6 +1558,111 @@ function getDashboardUI(hasDB) {
   
           document.getElementById('pwd').addEventListener('keypress', e => { if (e.key === 'Enter') doLogin(); });
   
+          function renderUsersTable() {
+              const tbl = document.getElementById('tbl-users');
+              if(!tbl) return;
+              let users = window.nahanConfig?.users || [];
+              let usage = window.nahanUsage || {};
+              tbl.innerHTML = '';
+              if (users.length === 0) {
+                  tbl.innerHTML = \`<tr><td colspan="5" class="px-4 py-8 text-center text-slate-400" data-i18n="no_users">\${i18n[lang].no_users}</td></tr>\`;
+                  return;
+              }
+              users.forEach((u, i) => {
+                  let b = usage[u.id.replace(/-/g,'').toLowerCase()]?.b || 0;
+                  let mb = (b / (1024*1024)).toFixed(2);
+                  let limitGbTxt = u.limitGb ? u.limitGb + ' GB' : 'Unlimited';
+                  let per = u.limitGb ? Math.min(100, (b / (u.limitGb * 1024 * 1024 * 1024)) * 100).toFixed(1) + '%' : '-';
+                  
+                  let expTxt = 'Unlimited';
+                  let isExp = false;
+                  if (u.expiryMs) {
+                      let date = new Date(u.expiryMs);
+                      expTxt = date.toLocaleDateString();
+                      if (Date.now() > u.expiryMs) { expTxt += ' <span class="text-xs text-red-500 font-bold">(Expired)</span>'; isExp = true; }
+                  }
+                  
+                  let linkHtml = \`<button onclick="copyData('sync-\${u.id}')" class="text-primary hover:text-indigo-700 bg-indigo-50 hover:bg-indigo-100 dark:bg-indigo-900/30 dark:hover:bg-indigo-800/50 p-2 rounded-lg" title="Copy Subscription Link">🔗</button>\`;
+                  
+                  let tr = document.createElement('tr');
+                  tr.className = "hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors";
+                  tr.innerHTML = \`
+                      <td class="px-4 py-4 font-bold text-slate-700 dark:text-slate-300">\${u.name} \${isExp ? '🔴' : '🟢'}</td>
+                      <td class="px-4 py-4 font-mono text-xs text-slate-500 select-all">\${u.id}</td>
+                      <td class="px-4 py-4 text-slate-600 dark:text-slate-400 font-mono"><div class="flex flex-col"><span class="font-bold">\${mb} MB</span><span class="text-xs opacity-70">Limit: \${limitGbTxt} (\${per})</span></div></td>
+                      <td class="px-4 py-4 text-slate-600 dark:text-slate-400">\${expTxt}</td>
+                      <td class="px-4 py-4 text-end space-x-2 space-x-reverse">
+                          <input type="hidden" id="sync-\${u.id}" value="\${window.nahanProfiles.find(p => p.id === u.id)?.sync || ''}">
+                          \${linkHtml}
+                          <button onclick="deleteUser('\${u.id}')" class="text-red-500 hover:text-red-700 bg-red-50 hover:bg-red-100 dark:bg-red-900/30 dark:hover:bg-red-800/50 p-2 rounded-lg">🗑️</button>
+                      </td>
+                  \`;
+                  tbl.appendChild(tr);
+              });
+              applyLang();
+          }
+
+          function deleteUser(uuid) {
+              if(!confirm('Are you sure you want to delete this user?')) return;
+              if(window.nahanConfig && window.nahanConfig.users) {
+                  window.nahanConfig.users = window.nahanConfig.users.filter(u => u.id !== uuid);
+              }
+              // Automatically sync
+              renderUsersTable();
+              doSaveDirectly();
+          }
+
+          function commitAddUser() {
+              const name = document.getElementById('add-user-name').value;
+              let gb = document.getElementById('add-user-gb').value;
+              let days = document.getElementById('add-user-days').value;
+              
+              if(!name) { alert('Please enter a name'); return; }
+              gb = gb ? parseFloat(gb) : null;
+              days = days ? parseInt(days) : null;
+              
+              if(!window.nahanConfig) window.nahanConfig = {};
+              if(!window.nahanConfig.users) window.nahanConfig.users = [];
+              
+              let newId = Array.from(crypto.getRandomValues(new Uint8Array(16)))
+                  .map((b,i) => (i===4||i===6||i===8||i===10?'-':'') + b.toString(16).padStart(2,'0')).join('');
+              
+              const u = {
+                  id: newId,
+                  name: name,
+                  limitGb: gb,
+                  expiryMs: days ? Date.now() + days*86400000 : null,
+                  createdAt: Date.now()
+              };
+              
+              window.nahanConfig.users.push(u);
+              document.getElementById('modal-add-user').classList.add('hidden');
+              document.getElementById('add-user-name').value = '';
+              document.getElementById('add-user-gb').value = '';
+              document.getElementById('add-user-days').value = '';
+              
+              renderUsersTable();
+              doSaveDirectly();
+          }
+
+          async function doSaveDirectly() {
+              const btn = document.querySelector('button[onclick="doSave()"]');
+              const origText = btn.innerText; btn.innerText = "...";
+              try {
+                  const res = await fetch(baseRoute + '/api/sync', {
+                      method: 'POST',
+                      headers: {'Content-Type': 'application/json'},
+                      body: JSON.stringify({ key: sessionKey, config: window.nahanConfig })
+                  });
+                  if(res.ok) {
+                       const stat = document.getElementById('save-status');
+                       stat.textContent = "Saved. Refreshing...";
+                       setTimeout(() => { doLogin(true); stat.textContent = ""; }, 1000);
+                  }
+              } catch(e) {}
+              btn.innerText = origText;
+          }
+
           document.addEventListener('DOMContentLoaded', () => {
               const cached = localStorage.getItem('nahan_session');
               if(cached) {
