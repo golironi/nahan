@@ -5,7 +5,7 @@ import { connect } from "cloudflare:sockets";
  * Handles real-time binary streams from remote sensor nodes.
  */
 
-const CURRENT_VERSION = "2.5.4.1";
+const CURRENT_VERSION = "2.5.4.2";
 
 const getAlpha = () => String.fromCharCode(118, 108, 101, 115, 115);
 const getBeta = () => String.fromCharCode(116, 114, 111, 106, 97, 110);
@@ -72,6 +72,14 @@ let activeDeviceId = "";
 let sysUsageCache = { users: {} };
 let lastSysUsageSync = 0;
 
+const CACHE_TTL_CONFIG = 10000;
+const CACHE_TTL_USAGE = 10000;
+const CACHE_TTL_BACKUP_IP = 30000;
+let sysConfigCacheTime = 0;
+let sysUsageCacheTime = 0;
+let backupIpCache = null;
+let backupIpCacheTime = 0;
+
 async function d1Init(env) {
     if(env.IOT_DB && !env.IOT_DB_INITIALIZED) {
         try { await env.IOT_DB.prepare("CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value TEXT)").run(); env.IOT_DB_INITIALIZED = true; } catch(e) { env.IOT_DB_INITIALIZED = true; }
@@ -87,6 +95,13 @@ async function d1Put(env, key, value) {
     if(!env.IOT_DB) return;
     await d1Init(env);
     try { await env.IOT_DB.prepare("INSERT INTO kv_store (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(key, value).run(); } catch(e) {}
+}
+
+async function cachedD1Put(env, key, value) {
+    await d1Put(env, key, value);
+    if (key === "sys_config") sysConfigCacheTime = 0;
+    else if (key === "sys_usage") sysUsageCacheTime = 0;
+    else if (key === "backup_ip") backupIpCacheTime = 0;
 }
 
 function sha224Hex(m) {
@@ -186,9 +201,9 @@ function trackUsage(uuid, bytes, env, ctx) {
             }
             
             if (changedConfig) {
-                ctx?.waitUntil(d1Put(env, "sys_config", JSON.stringify(sysConfig)).catch(()=>{}));
+                ctx?.waitUntil(cachedD1Put(env, "sys_config", JSON.stringify(sysConfig)).catch(()=>{}));
             }
-            ctx?.waitUntil(d1Put(env, "sys_usage", JSON.stringify(sysUsageCache)).catch(()=>{}));
+            ctx?.waitUntil(cachedD1Put(env, "sys_usage", JSON.stringify(sysUsageCache)).catch(()=>{}));
         }
     }
 }
@@ -251,7 +266,7 @@ export default {
                 }
                 if (reqPath === routes.syncPanel) {
                     if (request.method !== "POST") return new Response("405", { status: 405 });
-                    return await handleSyncPanel(request, env);
+                    return await handleSyncPanel(request, env, ctx);
                 }
                 if (reqPath === routes.tg) {
                     if (request.method !== "POST") return new Response("405", { status: 405 });
@@ -680,19 +695,54 @@ function serveSubscriptionInfoPage(user, host, url, request) {
     return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
 }
 
+let sysConfigLoading = null;
+let sysUsageLoading = null;
+let backupIpLoading = null;
+
 async function loadSysConfig(env) {
-    let dbData = null;
+    const now = Date.now();
+
     if (env.IOT_DB) {
-        try { const stored = await d1Get(env, "sys_config"); if (stored) dbData = JSON.parse(stored); } catch (e) { }
-        try { const ustored = await d1Get(env, "sys_usage"); if (ustored) sysUsageCache = JSON.parse(ustored); } catch (e) { }
+        if (now - sysConfigCacheTime > CACHE_TTL_CONFIG) {
+            if (!sysConfigLoading) {
+                sysConfigLoading = d1Get(env, "sys_config").then(stored => {
+                    sysConfig = { ...SYSTEM_DEFAULTS, ...(stored ? JSON.parse(stored) : null) };
+                    sysConfigCacheTime = Date.now();
+                }).catch(() => {
+                    sysConfig = { ...SYSTEM_DEFAULTS };
+                    sysConfigCacheTime = Date.now();
+                }).finally(() => { sysConfigLoading = null; });
+            }
+            await sysConfigLoading;
+        }
+        if (now - sysUsageCacheTime > CACHE_TTL_USAGE) {
+            if (!sysUsageLoading) {
+                sysUsageLoading = d1Get(env, "sys_usage").then(ustored => {
+                    if (ustored) sysUsageCache = JSON.parse(ustored);
+                    else sysUsageCache = { users: {} };
+                    sysUsageCacheTime = Date.now();
+                }).catch(() => {
+                    sysUsageCache = { users: {} };
+                    sysUsageCacheTime = Date.now();
+                }).finally(() => { sysUsageLoading = null; });
+            }
+            await sysUsageLoading;
+        }
     }
-    sysConfig = { ...SYSTEM_DEFAULTS, ...dbData };
-    let externalRelayFromDb = null;
-    if (env.IOT_DB) {
-        try { externalRelayFromDb = await d1Get(env, "backup_ip"); } catch (e) { }
+
+    if (now - backupIpCacheTime > CACHE_TTL_BACKUP_IP) {
+        if (!backupIpLoading) {
+            backupIpLoading = (env.IOT_DB ? d1Get(env, "backup_ip") : Promise.resolve(null)).then(val => {
+                backupIpCache = val;
+                backupIpCacheTime = Date.now();
+            }).catch(() => {
+                backupIpCacheTime = Date.now();
+            }).finally(() => { backupIpLoading = null; });
+        }
+        await backupIpLoading;
     }
     const defaultRelay = ["pro", "xy", "ip.cmliussss.net"].join("");
-    sysConfig.customRelay = externalRelayFromDb ?? env.RELAY_IP ?? defaultRelay;
+    sysConfig.customRelay = backupIpCache ?? env.RELAY_IP ?? defaultRelay;
 }
 
 async function fetchCloudflareUsage(accountId, apiToken) {
@@ -911,7 +961,7 @@ async function handleUsersApi(request, env, ctx) {
             };
             if (!sysConfig.users) sysConfig.users = [];
             sysConfig.users.push(newUser);
-            await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+            await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
             ctx?.waitUntil(logActivity(env, "User Created", `User "${name}" (${newId}) created via API`).catch(()=>{}));
             const hostName = new URL(request.url).hostname;
             const subUrl = `https://${hostName}/${sysConfig.apiRoute}?sub=${encodeURIComponent(name)}`;
@@ -936,7 +986,7 @@ async function handleUsersApi(request, env, ctx) {
                 if (body.status === "active") { u.isPaused = false; u.disabledReason = null; u.disabledAt = null; }
                 else if (body.status === "paused") { u.isPaused = true; u.disabledReason = null; u.disabledAt = null; }
             }
-            await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+            await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
             ctx?.waitUntil(logActivity(env, "User Updated", `User "${u.name}" (${userId}) updated via API`).catch(()=>{}));
             return new Response(JSON.stringify({ success: true, user: u }), { headers: { "Content-Type": "application/json" } });
         }
@@ -946,7 +996,7 @@ async function handleUsersApi(request, env, ctx) {
             const idx = sysConfig.users.findIndex(usr => usr.id === userId);
             if (idx === -1) return new Response(JSON.stringify({ success: false, error: "User not found" }), { status: 404, headers: { "Content-Type": "application/json" } });
             const deleted = sysConfig.users.splice(idx, 1)[0];
-            await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+            await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
             ctx?.waitUntil(logActivity(env, "User Deleted", `User "${deleted.name}" (${userId}) deleted via API`).catch(()=>{}));
             return new Response(JSON.stringify({ success: true, deleted: deleted.id }), { headers: { "Content-Type": "application/json" } });
         }
@@ -957,7 +1007,7 @@ async function handleUsersApi(request, env, ctx) {
             if (!u) return new Response(JSON.stringify({ success: false, error: "User not found" }), { status: 404, headers: { "Content-Type": "application/json" } });
             u.isPaused = !u.isPaused;
             if (!u.isPaused) { u.disabledReason = null; u.disabledAt = null; }
-            await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+            await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
             ctx?.waitUntil(logActivity(env, "User Toggled", `User "${u.name}" (${userId}) ${u.isPaused ? 'paused' : 'resumed'} via API`).catch(()=>{}));
             return new Response(JSON.stringify({ success: true, user: u }), { headers: { "Content-Type": "application/json" } });
         }
@@ -972,7 +1022,7 @@ async function handleUsersApi(request, env, ctx) {
             } else {
                 sysUsageCache.users[uuidClean] = { reqs: 0, dReqs: 0, lastDay: new Date().toISOString().split('T')[0] };
             }
-            await d1Put(env, "sys_usage", JSON.stringify(sysUsageCache));
+            await cachedD1Put(env, "sys_usage", JSON.stringify(sysUsageCache));
             ctx?.waitUntil(logActivity(env, "Traffic Reset", `Traffic reset for user ${userId} via API`).catch(()=>{}));
             return new Response(JSON.stringify({ success: true, message: "Traffic reset" }), { headers: { "Content-Type": "application/json" } });
         }
@@ -1115,7 +1165,7 @@ async function handleConfigSync(request, env, ctx) {
         if (data.config) {
             nextConfig = { ...sysConfig, ...data.config };
             sysConfig = nextConfig;
-            await d1Put(env, "sys_config", JSON.stringify(nextConfig));
+            await cachedD1Put(env, "sys_config", JSON.stringify(nextConfig));
         }
 
         if (data.resetUUID) {
@@ -1128,7 +1178,7 @@ async function handleConfigSync(request, env, ctx) {
             } else {
                 sysUsageCache.users[uuidClean] = { reqs: 0, dReqs: 0, lastDay: new Date().toISOString().split('T')[0] };
             }
-            await d1Put(env, "sys_usage", JSON.stringify(sysUsageCache));
+            await cachedD1Put(env, "sys_usage", JSON.stringify(sysUsageCache));
         }
 
         const oldMasterKey = sysConfig.masterKey;
@@ -1159,7 +1209,7 @@ async function handleConfigSync(request, env, ctx) {
     } catch (e) { return new Response(JSON.stringify({ success: false }), { status: 400 }); }
 }
 
-async function handleSyncPanel(request, env) {
+async function handleSyncPanel(request, env, ctx) {
     try {
         const data = await request.json();
         if (!data.signal || data.signal !== "panel_login") {
@@ -1182,7 +1232,7 @@ async function handleSyncPanel(request, env) {
             ts: data.ts || Date.now()
         };
         if (env.IOT_DB) {
-            await d1Put(env, "tg_panel_login", JSON.stringify(loginSignal));
+            ctx?.waitUntil(d1Put(env, "tg_panel_login", JSON.stringify(loginSignal)).catch(()=>{}));
         }
         return new Response(JSON.stringify({ success: true }), { status: 200 });
     } catch (e) {
@@ -1729,7 +1779,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
 
                 // Clear step state on callback query
                 tgState[chatId] = null;
-                await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
 
                 let answerText = null;
 
@@ -1738,12 +1788,12 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     await sendOrEdit(chatId, menu.text, menu.kb, messageId);
                 } else if (data === "sys_lang") {
                     sysConfig.tgBotLang = (langCode === "fa") ? "en" : "fa";
-                    await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+                    await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
                     const menu = getMainMenu(activePanel, isAuthorized);
                     await sendOrEdit(chatId, menu.text, menu.kb, messageId);
                 } else if (data === "sys_toggle_status") {
                     sysConfig.isPaused = !sysConfig.isPaused;
-                    await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+                    await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
                     const menu = getMainMenu(activePanel, isAuthorized);
                     await sendOrEdit(chatId, menu.text, menu.kb, messageId);
                 } else if (data === "sys_metrics") {
@@ -1794,7 +1844,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         const u = sysConfig.users.find(usr => usr.id === uuid);
                         if (u) {
                             u.isPaused = !u.isPaused;
-                            await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+                            await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
                         }
                     }
                     const panelUsers = await getPanelUsers();
@@ -1821,28 +1871,28 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         await remotePanelWriteAction(activePanel, 'DELETE', uuid);
                     } else if (sysConfig.users) {
                         sysConfig.users = sysConfig.users.filter(usr => usr.id !== uuid);
-                        await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+                        await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
                     }
                     const successText = `✅ ${t("msg_deleted")}`;
                     const kb = { inline_keyboard: [[{ text: t("btn_back"), callback_data: "subs_list:0" }]] };
                     await sendOrEdit(chatId, successText, kb, messageId);
                 } else if (data === "sub_add_init") {
                     tgState[chatId] = { step: "sub_add_name" };
-                    await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
                     const text = `➕ ${t("msg_enter_name")}`;
                     const kb = { inline_keyboard: [[{ text: `❌ ${t("btn_cancel")}`, callback_data: "subs_list:0" }]] };
                     await sendOrEdit(chatId, text, kb, messageId);
                 } else if (data.startsWith("sub_edit_name_init:")) {
                     const uuid = data.replace("sub_edit_name_init:", "");
                     tgState[chatId] = { step: `sub_edit_name:${uuid}` };
-                    await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
                     const text = `✏️ ${t("msg_enter_name")}`;
                     const kb = { inline_keyboard: [[{ text: `❌ ${t("btn_cancel")}`, callback_data: `sub_detail:${uuid}` }]] };
                     await sendOrEdit(chatId, text, kb, messageId);
                 } else if (data.startsWith("sub_edit_limits_init:")) {
                     const uuid = data.replace("sub_edit_limits_init:", "");
                     tgState[chatId] = { step: `sub_edit_limits:${uuid}` };
-                    await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
                     const text = `⚙️ ${t("msg_enter_limits")}`;
                     const kb = {
                         inline_keyboard: [
@@ -1861,7 +1911,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                             u.limitTotalReq = null;
                             u.limitDailyReq = null;
                             u.expiryMs = null;
-                            await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+                            await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
                         }
                     }
                     const panelUsers = await getPanelUsers();
@@ -1898,12 +1948,12 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                             expiryMs: null,
                             createdAt: Date.now()
                         });
-                        await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+                        await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
                         const detail = getSubDetail(newUuid);
                         await sendOrEdit(chatId, `✅ ${t("msg_added")}\n\n${detail.text}`, detail.kb, messageId);
                     }
                     tgState[chatId] = null;
-                    await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
                 } else if (data === "sys_panic_init") {
                     const text = `${t("msg_confirm_panic")}`;
                     const kb = {
@@ -1918,7 +1968,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                 } else if (data === "sys_panic_confirm") {
                     sysConfig.apiRoute = Array.from(crypto.getRandomValues(new Uint8Array(8))).map(b => b.toString(16).padStart(2,'0')).join('');
                     sysConfig.isPaused = true;
-                    await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+                    await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
                     const successText = `${t("msg_panic")}\n\n🔑 New Secret Path Randomized. All old sessions revoked.`;
                     const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] };
                     await sendOrEdit(chatId, successText, kb, messageId);
@@ -2061,7 +2111,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     }
                 } else if (data === "sub_search_init") {
                     tgState[chatId] = { step: "sub_search" };
-                    await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
                     const text = `🔍 ${t("msg_enter_search")}`;
                     const kb = { inline_keyboard: [[{ text: `❌ ${t("btn_cancel")}`, callback_data: "main_menu" }]] };
                     await sendOrEdit(chatId, text, kb, messageId);
@@ -2079,7 +2129,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         } else {
                             sysUsageCache.users[uuidClean] = { reqs: 0, dReqs: 0, lastDay: new Date().toISOString().split('T')[0] };
                         }
-                        await d1Put(env, "sys_usage", JSON.stringify(sysUsageCache));
+                        await cachedD1Put(env, "sys_usage", JSON.stringify(sysUsageCache));
                     }
                     const panelUsers = await getPanelUsers();
                     const detail = getSubDetail(uuid, panelUsers);
@@ -2087,21 +2137,21 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                 } else if (data.startsWith("sub_extend_init:")) {
                     const uuid = data.replace("sub_extend_init:", "");
                     tgState[chatId] = { step: `sub_extend_days:${uuid}` };
-                    await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
                     const text = `📅 ${t("msg_enter_extend_days")}`;
                     const kb = { inline_keyboard: [[{ text: `❌ ${t("btn_cancel")}`, callback_data: `sub_detail:${uuid}` }]] };
                     await sendOrEdit(chatId, text, kb, messageId);
                 } else if (data.startsWith("sub_edit_notes_init:")) {
                     const uuid = data.replace("sub_edit_notes_init:", "");
                     tgState[chatId] = { step: `sub_edit_notes:${uuid}` };
-                    await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
                     const text = `📝 ${t("msg_enter_notes")}`;
                     const kb = { inline_keyboard: [[{ text: `❌ ${t("btn_cancel")}`, callback_data: `sub_detail:${uuid}` }]] };
                     await sendOrEdit(chatId, text, kb, messageId);
                 } else if (data.startsWith("sub_edit_device_init:")) {
                     const uuid = data.replace("sub_edit_device_init:", "");
                     tgState[chatId] = { step: `sub_edit_device:${uuid}` };
-                    await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
                     const text = `📱 ${t("msg_enter_device_limit")}`;
                     const kb = { inline_keyboard: [
                         [{ text: `♾️ Unlimited`, callback_data: `sub_device_unlimited:${uuid}` }],
@@ -2116,7 +2166,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         const u = sysConfig.users.find(usr => usr.id === uuid);
                         if (u) {
                             u.maxConfigs = null;
-                            await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+                            await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
                         }
                     }
                     const panelUsers = await getPanelUsers();
@@ -2132,11 +2182,11 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     answerText = t("sub_link_sent");
                 }
                 
-                await fetch(`${tgApi}/answerCallbackQuery`, {
+                ctx?.waitUntil(fetch(`${tgApi}/answerCallbackQuery`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ callback_query_id: cb.id, text: answerText || "Done!" })
-                });
+                }).catch(()=>{}));
             }
         } else if (update.message && update.message.text) {
             const chatId = update.message.chat.id;
@@ -2159,7 +2209,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                 // Handle /start command
                 if (text === "/start") {
                     tgState[chatId] = null;
-                    await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
                     const menu = getMainMenu(activePanel, isAuthorized);
                     await sendOrEdit(chatId, menu.text, menu.kb);
                     return new Response("OK", { status: 200 });
@@ -2170,7 +2220,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                 if (state) {
                     if (!isAuthorized) {
                         tgState[chatId] = null;
-                        await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
                         await sendOrEdit(chatId, t("access_denied"));
                         return new Response("OK", { status: 200 });
                     }
@@ -2178,7 +2228,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     if (state.step === "sub_add_name") {
                         const name = text;
                         tgState[chatId] = { step: "sub_add_limits", name: name };
-                        await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
                         
                         const msg = `⚙️ **${name}**\n\n${t("msg_enter_limits")}`;
                         const kb = {
@@ -2229,13 +2279,13 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                                 expiryMs: days ? Date.now() + days * 86400000 : null,
                                 createdAt: Date.now()
                             });
-                            await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+                            await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
                             const detail = getSubDetail(newUuid);
                             await sendOrEdit(chatId, `✅ ${t("msg_added")}\n\n${detail.text}`, detail.kb);
                         }
                         
                         tgState[chatId] = null;
-                        await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
                         return new Response("OK", { status: 200 });
                     }
                     
@@ -2247,11 +2297,11 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                             const u = sysConfig.users.find(usr => usr.id === uuid);
                             if (u) {
                                 u.name = text;
-                                await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+                                await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
                             }
                         }
                         tgState[chatId] = null;
-                        await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
                         
                         const panelUsers = await getPanelUsers();
                         const detail = getSubDetail(uuid, panelUsers);
@@ -2283,11 +2333,11 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                                 u.limitTotalReq = tReq;
                                 u.limitDailyReq = dReq;
                                 u.expiryMs = days ? Date.now() + days * 86400000 : null;
-                                await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+                                await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
                             }
                         }
                         tgState[chatId] = null;
-                        await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
                         
                         const panelUsers = await getPanelUsers();
                         const detail = getSubDetail(uuid, panelUsers);
@@ -2301,7 +2351,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         const users = panelUsers || [];
                         const results = users.filter(u => u.name.toLowerCase().includes(query) || u.id.toLowerCase().includes(query));
                         tgState[chatId] = null;
-                        await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
                         if (results.length === 0) {
                             const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] };
                             await sendOrEdit(chatId, `🔍 No users found for "${text}"`, kb);
@@ -2341,11 +2391,11 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                                     u.disabledReason = null;
                                     u.disabledAt = null;
                                 }
-                                await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+                                await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
                             }
                         }
                         tgState[chatId] = null;
-                        await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
                         const panelUsers = await getPanelUsers();
                         const detail = getSubDetail(uuid, panelUsers);
                         const msg = t("msg_expiry_extended").replace("{days}", days);
@@ -2361,11 +2411,11 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                             const u = sysConfig.users.find(usr => usr.id === uuid);
                             if (u) {
                                 u.notes = text;
-                                await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+                                await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
                             }
                         }
                         tgState[chatId] = null;
-                        await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
                         const panelUsers = await getPanelUsers();
                         const detail = getSubDetail(uuid, panelUsers);
                         await sendOrEdit(chatId, `✅ Notes updated!`, detail.kb);
@@ -2385,11 +2435,11 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                             const u = sysConfig.users.find(usr => usr.id === uuid);
                             if (u) {
                                 u.maxConfigs = limit > 0 ? limit : null;
-                                await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+                                await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
                             }
                         }
                         tgState[chatId] = null;
-                        await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
                         const panelUsers = await getPanelUsers();
                         const detail = getSubDetail(uuid, panelUsers);
                         await sendOrEdit(chatId, `✅ ${t("config_limit_updated")}`, detail.kb);
@@ -4769,6 +4819,18 @@ function getDashboardUI(hasDB) {
           };
 
           const CHANGELOG_DATA = {
+              "2.5.4.2": {
+                  headline: { en: "Performance Optimization & Background Processing", fa: "بهینه‌سازی عملکرد و پردازش پس‌زمینه" },
+                  added: [],
+                  fixed: [],
+                  improved: [
+                      { en: "Improved system performance using smart caching (faster responses and less database load)", fa: "بهبود عملکرد سیستم با استفاده از کش هوشمند (پاسخ‌ سریع‌تر و بار کمتر روی پایگاه داده)" },
+                      { en: "Added smart caching system (TTL) for configuration and usage data", fa: "افزودن سیستم کش هوشمند (TTL) برای داده‌های تنظیمات و مصرف" },
+                      { en: "Reduced database calls to make the panel faster and more efficient", fa: "کاهش درخواست‌ها به پایگاه داده برای سریع‌تر و کاراتر شدن پنل" },
+                      { en: "Background processing added for non-critical tasks to improve speed", fa: "افزودن پردازش پس‌زمینه برای کارهای غیربحرانی جهت بهبود سرعت" },
+                  ],
+                  notes: []
+              },
               "2.5.4.1": {
                   headline: { en: "Security Hotfix — Bot Authorization", fa: "اصلاح امنیتی — احراز هویت ربات" },
                   added: [],
