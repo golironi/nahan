@@ -5,7 +5,7 @@ import { connect } from "cloudflare:sockets";
  * Handles real-time binary streams from remote sensor nodes.
  */
 
-const CURRENT_VERSION = "2.5.4";
+const CURRENT_VERSION = "2.6.0";
 
 const getAlpha = () => String.fromCharCode(118, 108, 101, 115, 115);
 const getBeta = () => String.fromCharCode(116, 114, 111, 106, 97, 110);
@@ -48,6 +48,7 @@ const SYSTEM_DEFAULTS = {
     tgAdminId: "",
     cfAccountId: "",
     cfApiToken: "",
+    cfWorkerName: "",
     isPaused: false,
     silentAlerts: false,
     githubRepo: "itsyebekhe/nahan",
@@ -61,16 +62,65 @@ const SYSTEM_DEFAULTS = {
     expiryMs: 0,
     linkedPanels: [],
     hubPanelUrl: "",
+    allowSyncWorker: false,
+    nat64Prefix: "",
+    enableDirectConfigs: false,
+    autoUpdate: false,
+    autoUpdateFormat: "normal",
+    fakeConfigs: [
+        { name: "📊 {usage}", enabled: true },
+        { name: "📅 {expiry}", enabled: true }
+    ],
 };
 
 let sysConfig = { ...SYSTEM_DEFAULTS };
-let isolateStartTime = Date.now();
+let isolateStartTime = 0;
 let activeConnections = 0;
 let uuidUsage = new Map();
 let activeDeviceId = "";
+let configRegistry = new Map();
 
 let sysUsageCache = { users: {} };
 let lastSysUsageSync = 0;
+
+const CACHE_TTL_CONFIG = 10000;
+const CACHE_TTL_USAGE = 10000;
+const CACHE_TTL_BACKUP_IP = 30000;
+let sysConfigCacheTime = 0;
+let sysUsageCacheTime = 0;
+let backupIpCache = null;
+let backupIpCacheTime = 0;
+
+async function deployWorkerToCloudflare(accountId, apiToken, workerName, code) {
+
+    let currentBindings = [];
+    try {
+        const settingsRes = await fetch(
+            `https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/scripts/${encodeURIComponent(workerName)}/settings`,
+            { headers: { "Authorization": `Bearer ${apiToken}` } }
+        );
+        const settingsJson = await settingsRes.json();
+        if (settingsJson.success && settingsJson.result?.bindings) {
+            currentBindings = settingsJson.result.bindings;
+        }
+    } catch(e) {}
+
+    const metadata = {
+        main_module: "_worker.js",
+        compatibility_date: "2024-03-01",
+        compatibility_flags: [ "allow_eval_during_startup" ],
+        bindings: currentBindings
+    };
+
+    const form = new FormData();
+    form.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
+    form.append("_worker.js", new Blob([code], { type: "application/javascript+module" }), "_worker.js");
+
+    return await fetch(
+        `https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/scripts/${encodeURIComponent(workerName)}`,
+        { method: "PUT", headers: { "Authorization": `Bearer ${apiToken}` }, body: form }
+    );
+}
 
 async function d1Init(env) {
     if(env.IOT_DB && !env.IOT_DB_INITIALIZED) {
@@ -87,6 +137,13 @@ async function d1Put(env, key, value) {
     if(!env.IOT_DB) return;
     await d1Init(env);
     try { await env.IOT_DB.prepare("INSERT INTO kv_store (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(key, value).run(); } catch(e) {}
+}
+
+async function cachedD1Put(env, key, value) {
+    await d1Put(env, key, value);
+    if (key === "sys_config") sysConfigCacheTime = 0;
+    else if (key === "sys_usage") sysUsageCacheTime = 0;
+    else if (key === "backup_ip") backupIpCacheTime = 0;
 }
 
 function sha224Hex(m) {
@@ -126,6 +183,30 @@ function getTrojanHash(uuid) {
     const hash = sha224Hex(uuid);
     trojanHashCache.set(uuid, hash);
     return hash;
+}
+
+function registerConfigEntry(uuid, userId, relayIp) {
+    configRegistry.set(uuid.replace(/-/g, '').toLowerCase(), { userId, relayIp: relayIp || '' });
+}
+
+function lookupConfigEntry(uuidHex) {
+    return configRegistry.get(uuidHex.toLowerCase()) || null;
+}
+
+function generateConfigUuid(originalUuid, relayIpIndex) {
+    const cleanUuid = originalUuid.replace(/-/g, '').toLowerCase();
+    const userPart = cleanUuid.substring(0, 24);
+    const relayPart = relayIpIndex.toString(16).padStart(8, '0');
+    const fullHex = userPart + relayPart;
+    return `${fullHex.substring(0,8)}-${fullHex.substring(8,12)}-${fullHex.substring(12,16)}-${fullHex.substring(16,20)}-${fullHex.substring(20,32)}`;
+}
+
+function decodeConfigUuid(uuid) {
+    const cleanUuid = uuid.replace(/-/g, '').toLowerCase();
+    if (cleanUuid.length !== 32) return null;
+    const userFingerprint = cleanUuid.substring(0, 24);
+    const relayIpIndex = parseInt(cleanUuid.substring(24, 32), 16);
+    return { userFingerprint, relayIpIndex };
 }
 
 function trackUsage(uuid, bytes, env, ctx) {
@@ -186,9 +267,9 @@ function trackUsage(uuid, bytes, env, ctx) {
             }
             
             if (changedConfig) {
-                ctx?.waitUntil(d1Put(env, "sys_config", JSON.stringify(sysConfig)).catch(()=>{}));
+                ctx?.waitUntil(cachedD1Put(env, "sys_config", JSON.stringify(sysConfig)).catch(()=>{}));
             }
-            ctx?.waitUntil(d1Put(env, "sys_usage", JSON.stringify(sysUsageCache)).catch(()=>{}));
+            ctx?.waitUntil(cachedD1Put(env, "sys_usage", JSON.stringify(sysUsageCache)).catch(()=>{}));
         }
     }
 }
@@ -196,6 +277,7 @@ function trackUsage(uuid, bytes, env, ctx) {
 export default {
     async fetch(request, env, ctx) {
         try {
+            if (!isolateStartTime) isolateStartTime = Date.now();
             await loadSysConfig(env);
             activeDeviceId = sysConfig.deviceId || generateHardwareId(sysConfig.apiRoute);
 
@@ -216,12 +298,14 @@ export default {
                 logs: `/${encodeURI(sysConfig.apiRoute)}/api/logs`,
                 users: `/${encodeURI(sysConfig.apiRoute)}/api/users`,
                 stats: `/${encodeURI(sysConfig.apiRoute)}/api/stats`,
+                update: `/${encodeURI(sysConfig.apiRoute)}/api/update`,
             };
 
             const isSyncRoute = reqPath.endsWith('/api/sync');
             const isUsersRoute = reqPath === routes.users || reqPath.endsWith('/api/users');
             const isStatsRoute = reqPath === routes.stats || reqPath.endsWith('/api/stats');
-            const isAuthorizedRoute = reqPath === routes.data || reqPath === routes.dash || reqPath === routes.auth || reqPath === routes.sync || reqPath === routes.tg || reqPath === routes.syncPanel || reqPath === routes.logs || isSyncRoute || isUsersRoute || isStatsRoute;
+            const isUpdateRoute = reqPath === routes.update || reqPath.endsWith('/api/update');
+            const isAuthorizedRoute = reqPath === routes.data || reqPath === routes.dash || reqPath === routes.auth || reqPath === routes.sync || reqPath === routes.tg || reqPath === routes.syncPanel || reqPath === routes.logs || isSyncRoute || isUsersRoute || isStatsRoute || isUpdateRoute;
 
             if (!isTelemetryStream && !isAuthorizedRoute) {
                 return serveMaintenancePage(request, url);
@@ -249,9 +333,12 @@ export default {
                 if (isStatsRoute) {
                     return await handleStatsApi(request, env);
                 }
+                if (isUpdateRoute) {
+                    return await handleUpdateApi(request, env, ctx);
+                }
                 if (reqPath === routes.syncPanel) {
                     if (request.method !== "POST") return new Response("405", { status: 405 });
-                    return await handleSyncPanel(request, env);
+                    return await handleSyncPanel(request, env, ctx);
                 }
                 if (reqPath === routes.tg) {
                     if (request.method !== "POST") return new Response("405", { status: 405 });
@@ -366,22 +453,22 @@ export default {
 
                     if (isClashYaml) {
                         resHeaders.set("Content-Type", "text/yaml; charset=utf-8");
-                        return new Response(buildYamlProfile(clientHost, targetSub, allowInsecure), {
+                        return new Response(await buildYamlProfile(clientHost, targetSub, allowInsecure), {
                             headers: resHeaders
                         });
                     } else if (isSingboxJson) {
                         resHeaders.set("Content-Type", "application/json; charset=utf-8");
-                        return new Response(JSON.stringify(buildSingBoxJsonProfile(clientHost, targetSub, allowInsecure), null, 2), {
+                        return new Response(JSON.stringify(await buildSingBoxJsonProfile(clientHost, targetSub, allowInsecure), null, 2), {
                             headers: resHeaders
                         });
                     } else if (isClashJson) {
                         resHeaders.set("Content-Type", "application/json; charset=utf-8");
-                        return new Response(JSON.stringify(buildClashJsonProfile(clientHost, targetSub, allowInsecure), null, 2), {
+                        return new Response(JSON.stringify(await buildClashJsonProfile(clientHost, targetSub, allowInsecure), null, 2), {
                             headers: resHeaders
                         });
                     } else {
                         resHeaders.set("Content-Type", "text/plain; charset=utf-8");
-                        const raw = buildUriProfile(clientHost, targetSub, allowInsecure);
+                        const raw = await buildUriProfile(clientHost, targetSub, allowInsecure);
                         return new Response(safeBtoa(raw), {
                             headers: resHeaders
                         });
@@ -425,47 +512,37 @@ function serveSubscriptionInfoPage(user, host, url, request) {
     let idClean = user.id.replace(/-/g, '').toLowerCase();
     let sysU = sysUsageCache?.users?.[idClean] || { reqs: 0, dReqs: 0, lastDay: '' };
     let totalReqs = sysU.reqs || 0;
-    
+
     let todayDate = new Date().toISOString().split('T')[0];
     let dailyReqs = sysU.lastDay === todayDate ? (sysU.dReqs || 0) : 0;
-    
+
     let limitTotal = user.limitTotalReq || 0;
     let limitDaily = user.limitDailyReq || 0;
-    
+
     let totalGb = (totalReqs / 6000).toFixed(2);
-    let limitTotalGb = limitTotal ? (limitTotal / 6000).toFixed(2) : 'Unlimited';
-    
+    let limitTotalGb = limitTotal ? (limitTotal / 6000).toFixed(2) : '9999';
+
     let dailyGb = (dailyReqs / 6000).toFixed(2);
-    let limitDailyGb = limitDaily ? (limitDaily / 6000).toFixed(2) : 'Unlimited';
-    
+    let limitDailyGb = limitDaily ? (limitDaily / 6000).toFixed(2) : '9999';
+
     let totalPercent = limitTotal ? Math.min(100, (totalReqs / limitTotal) * 100).toFixed(1) : 0;
     let dailyPercent = limitDaily ? Math.min(100, (dailyReqs / limitDaily) * 100).toFixed(1) : 0;
-    
-    let expiryDateTxt = 'Never Expired';
+
+    let expiryDateTxt = '2099-01-01';
     let isExpired = false;
     if (user.expiryMs) {
         let exp = new Date(user.expiryMs);
-        expiryDateTxt = exp.toLocaleDateString();
+        expiryDateTxt = exp.toISOString().split('T')[0];
         if (Date.now() > user.expiryMs) {
             isExpired = true;
         }
     }
-    
-    let statusText = "Active 🟢";
-    let statusColor = "text-emerald-500 bg-emerald-500/10 border-emerald-500/25";
-    if (user.isPaused) {
-        statusText = "Paused ⏸️";
-        statusColor = "text-amber-500 bg-amber-500/10 border-amber-500/25";
-    } else if (isExpired) {
-        statusText = "Expired 🔴";
-        statusColor = "text-red-500 bg-red-500/10 border-red-500/25";
-    } else if (limitTotal && totalReqs >= limitTotal) {
-        statusText = "Limit Exceeded ⚠️";
-        statusColor = "text-rose-500 bg-rose-500/10 border-rose-500/25";
-    } else if (limitDaily && dailyReqs >= limitDaily) {
-        statusText = "Daily Limit Exceeded ⚠️";
-        statusColor = "text-rose-500 bg-rose-500/10 border-rose-500/25";
-    }
+
+    let statusCode = 'active';
+    if (user.isPaused) statusCode = 'paused';
+    else if (isExpired) statusCode = 'expired';
+    else if (limitTotal && totalReqs >= limitTotal) statusCode = 'limit';
+    else if (limitDaily && dailyReqs >= limitDaily) statusCode = 'dailyLimit';
 
     let cleanUrl = new URL(url.href);
     if (sysConfig.customPanelUrl && sysConfig.customPanelUrl.trim()) {
@@ -484,181 +561,427 @@ function serveSubscriptionInfoPage(user, host, url, request) {
     cleanUrl.searchParams.delete("type");
     cleanUrl.searchParams.delete("output");
     cleanUrl.searchParams.delete("raw");
-    
+
     let syncNormal = cleanUrl.href;
     let syncRaw = cleanUrl.href + (cleanUrl.href.includes('?') ? '&flag=a' : '?flag=a');
 
     const html = `<!DOCTYPE html>
-<html lang="en" class="dark">
+<html lang="en" dir="ltr">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>${user.name} - Subscriber Portal</title>
-    <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;700;900&display=swap" rel="stylesheet">
-    <script src="https://cdn.tailwindcss.com"></script>
-    <style>
-        body {
-            font-family: 'Vazirmatn', sans-serif;
-            background: linear-gradient(135deg, #0d1117 0%, #0f172a 50%, #0d1117 100%) !important;
-            color: #f1f5f9;
+    <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700;800;900&family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+    <script src="https://cdn.tailwindcss.com"><\/script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    fontFamily: {
+                        fa: ['Vazirmatn', 'sans-serif'],
+                        en: ['Inter', 'sans-serif'],
+                    }
+                }
+            }
         }
-        .premium-card {
-            background: linear-gradient(145deg, rgba(15, 20, 40, 0.8), rgba(13, 17, 23, 0.8)) !important;
-            border: 1px solid rgba(99, 102, 241, 0.25) !important;
-            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.05) !important;
+    <\/script>
+    <style>
+        :root {
+            --bg-primary: #f8fafc;
+            --bg-card: #ffffff;
+            --bg-card-inner: #f1f5f9;
+            --bg-input: #f1f5f9;
+            --border-card: #e2e8f0;
+            --border-inner: #e2e8f0;
+            --text-primary: #0f172a;
+            --text-secondary: #475569;
+            --text-muted: #94a3b8;
+            --accent: #6366f1;
+            --accent-light: #eef2ff;
+            --accent-border: #c7d2fe;
+            --accent-hover: #4f46e5;
+            --green-bg: #ecfdf5;
+            --green-border: #a7f3d0;
+            --green-text: #059669;
+            --amber-bg: #fffbeb;
+            --amber-border: #fde68a;
+            --amber-text: #d97706;
+            --red-bg: #fef2f2;
+            --red-border: #fecaca;
+            --red-text: #dc2626;
+            --progress-bg: #e2e8f0;
+            --shadow-card: 0 4px 24px rgba(0,0,0,0.06);
+            --btn-primary-bg: #6366f1;
+            --btn-primary-hover: #4f46e5;
+            --btn-secondary-bg: #f1f5f9;
+            --btn-secondary-hover: #e2e8f0;
+            --modal-bg: rgba(0,0,0,0.4);
+            --modal-card: #ffffff;
+        }
+        .dark {
+            --bg-primary: #0d1117;
+            --bg-card: rgba(15, 20, 40, 0.8);
+            --bg-card-inner: rgba(15, 23, 42, 0.6);
+            --bg-input: #020617;
+            --border-card: rgba(99, 102, 241, 0.25);
+            --border-inner: rgba(99, 102, 241, 0.08);
+            --text-primary: #f1f5f9;
+            --text-secondary: #94a3b8;
+            --text-muted: #475569;
+            --accent: #818cf8;
+            --accent-light: rgba(99, 102, 241, 0.15);
+            --accent-border: rgba(99, 102, 241, 0.3);
+            --accent-hover: #6366f1;
+            --green-bg: rgba(16, 185, 129, 0.1);
+            --green-border: rgba(16, 185, 129, 0.25);
+            --green-text: #34d399;
+            --amber-bg: rgba(245, 158, 11, 0.1);
+            --amber-border: rgba(245, 158, 11, 0.25);
+            --amber-text: #fbbf24;
+            --red-bg: rgba(239, 68, 68, 0.1);
+            --red-border: rgba(239, 68, 68, 0.25);
+            --red-text: #f87171;
+            --progress-bg: rgba(30, 41, 59, 0.8);
+            --btn-primary-bg: #6366f1;
+            --btn-primary-hover: #4f46e5;
+            --btn-secondary-bg: rgba(30, 41, 59, 0.6);
+            --btn-secondary-hover: rgba(30, 41, 59, 0.9);
+            --modal-bg: rgba(0,0,0,0.7);
+            --modal-card: #0f172a;
+        }
+        body {
+            font-family: 'Inter', 'Vazirmatn', sans-serif;
+            background: var(--bg-primary) !important;
+            color: var(--text-primary);
+            transition: background 0.3s, color 0.3s;
+        }
+        [lang="fa"] body { font-family: 'Vazirmatn', sans-serif; }
+        .card-main {
+            background: var(--bg-card) !important;
+            border: 1px solid var(--border-card) !important;
+            box-shadow: var(--shadow-card) !important;
+            transition: all 0.3s;
+        }
+        .card-inner {
+            background: var(--bg-card-inner);
+            border: 1px solid var(--border-inner);
+            transition: all 0.3s;
+        }
+        .input-field {
+            background: var(--bg-input);
+            border: 1px solid var(--border-inner);
+            color: var(--text-primary);
         }
         ::-webkit-scrollbar { width: 6px; }
-        ::-webkit-scrollbar-thumb { background: rgba(99, 102, 241, 0.3); border-radius: 10px; }
+        ::-webkit-scrollbar-thumb { background: var(--accent); border-radius: 10px; }
+        .btn-primary {
+            background: var(--btn-primary-bg);
+            color: white;
+        }
+        .btn-primary:hover { background: var(--btn-primary-hover); }
+        .btn-secondary {
+            background: var(--btn-secondary-bg);
+            color: var(--text-primary);
+            border: 1px solid var(--border-inner);
+        }
+        .btn-secondary:hover { background: var(--btn-secondary-hover); }
+        .text-secondary { color: var(--text-secondary); }
+        .text-muted { color: var(--text-muted); }
+        .border-card-main { border-color: var(--border-card) !important; }
+        .progress-bar-bg { background: var(--progress-bg); }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        .fade-in { animation: fadeIn 0.4s ease-out; }
+        .modal-overlay { background: var(--modal-bg); }
+        .modal-card { background: var(--modal-card); border: 1px solid var(--border-card); }
     </style>
 </head>
-<body class="min-h-screen py-10 px-4 flex flex-col items-center justify-center">
+<body class="min-h-screen py-6 px-4 flex flex-col items-center justify-center fade-in">
 
-    <div class="w-full max-w-2xl premium-card rounded-3xl p-6 md:p-8 space-y-8 relative overflow-hidden">
-        <div class="absolute top-0 right-0 w-48 h-48 bg-indigo-500/5 rounded-bl-[100px] -z-10"></div>
-        
+    <!-- Theme & Language Toggle -->
+    <div class="fixed top-4 left-4 right-4 flex justify-between items-center z-50 max-w-2xl mx-auto">
+        <div class="flex gap-2">
+            <button onclick="toggleTheme()" id="theme-toggle" class="btn-secondary px-3 py-2 rounded-xl text-xs font-semibold transition-all flex items-center gap-1.5" title="Toggle Theme">
+                <span id="theme-icon">\u2600\ufe0f</span>
+                <span id="theme-label"></span>
+            </button>
+            <button onclick="toggleLang()" id="lang-toggle" class="btn-secondary px-3 py-2 rounded-xl text-xs font-semibold transition-all flex items-center gap-1.5" title="Toggle Language">
+                <span id="lang-icon">🇺🇸</span>
+                <span id="lang-label">EN</span>
+            </button>
+        </div>
+    </div>
+
+    <div class="w-full max-w-2xl card-main rounded-3xl p-6 md:p-8 space-y-6 relative overflow-hidden mt-12" id="main-card">
+
         <!-- Header -->
-        <div class="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-6 border-b border-indigo-500/10">
+        <div class="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-5 border-b border-card-main" style="border-color: var(--border-inner);">
             <div class="flex items-center gap-4">
-                <div class="p-4 bg-indigo-500/10 text-indigo-400 rounded-2xl border border-indigo-500/20">
-                    <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"></path></svg>
+                <div class="p-4 rounded-2xl" style="background: var(--accent-light); color: var(--accent); border: 1px solid var(--accent-border);">
+                    <svg class="w-7 h-7" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"></path></svg>
                 </div>
                 <div>
-                    <h1 class="text-2xl font-black tracking-tight text-white">${user.name}</h1>
-                    <p class="text-xs text-slate-400 mt-1 font-mono">${user.id}</p>
+                    <h1 class="text-xl md:text-2xl font-black tracking-tight" style="color: var(--text-primary);">${user.name}</h1>
+                    <p class="text-xs mt-1 font-mono" style="color: var(--text-muted);">${user.id}</p>
                 </div>
             </div>
             <div class="shrink-0">
-                <span class="px-4 py-2 rounded-2xl text-xs font-bold border ${statusColor} inline-block">${statusText}</span>
+                <span id="status-badge" class="px-4 py-2 rounded-2xl text-xs font-bold inline-block"></span>
             </div>
         </div>
 
         <!-- Metrics Section -->
         <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
             <!-- Total Traffic -->
-            <div class="bg-slate-900/40 border border-indigo-500/5 rounded-2xl p-4">
-                <p class="text-xs font-semibold text-slate-400 uppercase tracking-widest">Total Usage</p>
+            <div class="card-inner rounded-2xl p-4">
+                <p class="text-xs font-semibold uppercase tracking-widest text-secondary" data-i18n="totalUsage">Total Usage</p>
                 <div class="flex items-baseline gap-1.5 mt-2">
-                    <span class="text-2xl font-black text-white">${totalGb}</span>
-                    <span class="text-xs text-slate-400">/ ${limitTotalGb} GB</span>
+                    <span class="text-2xl font-black" style="color: var(--text-primary);">${totalGb}</span>
+                    <span class="text-xs text-secondary">/ ${limitTotalGb} GB</span>
                 </div>
                 ${limitTotal ? `
-                <div class="w-full bg-slate-800 rounded-full h-1.5 mt-3 overflow-hidden">
-                    <div class="bg-indigo-500 h-1.5 rounded-full" style="width: ${totalPercent}%"></div>
+                <div class="w-full rounded-full h-1.5 mt-3 overflow-hidden progress-bar-bg">
+                    <div class="h-1.5 rounded-full" style="background: var(--accent); width: ${totalPercent}%;"></div>
                 </div>
-                <p class="text-[10px] text-slate-500 text-right mt-1.5">${totalPercent}% Used</p>
-                ` : `<p class="text-[10px] text-slate-500 mt-2">Unlimited Plan</p>`}
+                <p class="text-[10px] text-muted text-right mt-1.5" data-i18n="used">${totalPercent}% Used</p>
+                ` : `<p class="text-[10px] text-muted mt-2" data-i18n="unlimitedPlan">Unlimited Plan</p>`}
             </div>
 
             <!-- Daily Traffic -->
-            <div class="bg-slate-900/40 border border-indigo-500/5 rounded-2xl p-4">
-                <p class="text-xs font-semibold text-slate-400 uppercase tracking-widest">Daily Usage</p>
+            <div class="card-inner rounded-2xl p-4">
+                <p class="text-xs font-semibold uppercase tracking-widest text-secondary" data-i18n="dailyUsage">Daily Usage</p>
                 <div class="flex items-baseline gap-1.5 mt-2">
-                    <span class="text-2xl font-black text-white">${dailyGb}</span>
-                    <span class="text-xs text-slate-400">/ ${limitDailyGb} GB</span>
+                    <span class="text-2xl font-black" style="color: var(--text-primary);">${dailyGb}</span>
+                    <span class="text-xs text-secondary">/ ${limitDailyGb} GB</span>
                 </div>
                 ${limitDaily ? `
-                <div class="w-full bg-slate-800 rounded-full h-1.5 mt-3 overflow-hidden">
-                    <div class="bg-amber-500 h-1.5 rounded-full" style="width: ${dailyPercent}%"></div>
+                <div class="w-full rounded-full h-1.5 mt-3 overflow-hidden progress-bar-bg">
+                    <div class="h-1.5 rounded-full" style="background: var(--amber-text); width: ${dailyPercent}%;"></div>
                 </div>
-                <p class="text-[10px] text-slate-500 text-right mt-1.5">${dailyPercent}% Used</p>
-                ` : `<p class="text-[10px] text-slate-500 mt-2">No Daily Limit</p>`}
+                <p class="text-[10px] text-muted text-right mt-1.5" data-i18n="used">${dailyPercent}% Used</p>
+                ` : `<p class="text-[10px] text-muted mt-2" data-i18n="noDailyLimit">No Daily Limit</p>`}
             </div>
 
             <!-- Expiration -->
-            <div class="bg-slate-900/40 border border-indigo-500/5 rounded-2xl p-4 flex flex-col justify-between">
+            <div class="card-inner rounded-2xl p-4 flex flex-col justify-between">
                 <div>
-                    <p class="text-xs font-semibold text-slate-400 uppercase tracking-widest">Expiration Date</p>
-                    <p class="text-lg font-bold text-white mt-2">${expiryDateTxt}</p>
+                    <p class="text-xs font-semibold uppercase tracking-widest text-secondary" data-i18n="expDate">Expiration Date</p>
+                    <p class="text-lg font-bold mt-2" style="color: var(--text-primary);">${expiryDateTxt}</p>
                 </div>
-                <p class="text-[10px] text-slate-500 mt-1">Calendar Local Time</p>
+                <p class="text-[10px] text-muted mt-1" data-i18n="calendarLocal">Calendar Local Time</p>
             </div>
         </div>
 
         <!-- Connection Settings Title -->
         <div>
-            <h2 class="text-lg font-bold mb-1 flex items-center gap-2">
-                <span class="w-2.5 h-2.5 rounded-full bg-indigo-500"></span>
-                Integration Connections
+            <h2 class="text-lg font-bold mb-1 flex items-center gap-2" style="color: var(--text-primary);">
+                <span class="w-2.5 h-2.5 rounded-full" style="background: var(--accent);"></span>
+                <span data-i18n="integrationTitle">Integration Connections</span>
             </h2>
-            <p class="text-xs text-slate-400">Add the correct configuration link based on your preferred format below.</p>
+            <p class="text-xs text-secondary" data-i18n="integrationDesc">Add the correct configuration link based on your preferred format below.</p>
         </div>
 
         <!-- Connection Options -->
-        <div class="space-y-6">
-            <!-- Universal Client-Aware Sub -->
-            <div class="bg-slate-900/50 border border-indigo-500/10 p-5 rounded-2xl relative">
+        <div class="space-y-4">
+            <div class="card-inner p-5 rounded-2xl relative">
                 <div class="flex items-center justify-between mb-3">
                     <div>
-                        <span class="text-xs font-bold text-emerald-400">Universal Auto-Detecting Configuration Link</span>
-                        <p class="text-[11px] text-slate-400 mt-1">This universal URL automatically detects your client (Clash, Sing-box, or base64 collectors) and delivers the perfect optimized subscription profile format.</p>
+                        <span class="text-xs font-bold" style="color: var(--green-text);" data-i18n="universalLink">Universal Auto-Detecting Configuration Link</span>
+                        <p class="text-[11px] text-secondary mt-1" data-i18n="universalDesc">This universal URL automatically detects your client and delivers the optimal format.</p>
                     </div>
                 </div>
                 <div class="relative flex items-center">
-                    <input type="text" id="sub-norm" readonly value="${syncNormal}" class="w-full bg-slate-950 border border-indigo-500/10 px-4 py-3 rounded-xl text-xs font-mono text-slate-400 pr-16 truncate outline-none">
+                    <input type="text" id="sub-norm" readonly value="${syncNormal}" class="input-field w-full px-4 py-3 rounded-xl text-xs font-mono pr-16 truncate outline-none" style="color: var(--text-secondary);">
                     <div class="absolute right-2 flex gap-1">
-                        <button onclick="copyLink('sub-norm')" class="p-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs transition-colors">Copy</button>
-                        <button onclick="showQRModal('Universal Subscription Sync Link', '${syncNormal}')" class="p-2 bg-slate-800 hover:bg-slate-700 text-indigo-400 rounded-lg text-xs transition-colors">QR</button>
+                        <button onclick="copyLink('sub-norm')" class="btn-primary px-3 py-2 rounded-lg text-xs font-bold transition-colors" data-i18n="copy">Copy</button>
+                        <button onclick="showQRModal()" class="btn-secondary px-3 py-2 rounded-lg text-xs font-bold transition-colors" data-i18n="qr">QR</button>
                     </div>
                 </div>
-                <p class="text-[10px] text-slate-500 mt-2">Allows real-time import of complete nodes list with dynamic configuration update capability.</p>
+                <p class="text-[10px] text-muted mt-2" data-i18n="universalNote">Real-time import of complete nodes list with dynamic configuration update.</p>
             </div>
         </div>
 
-        <!-- Custom Action Buttons -->
-        <div class="pt-6 border-t border-indigo-500/10 grid grid-cols-1 sm:grid-cols-2 gap-4">
-            <button onclick="fetchDecodedRawContent()" class="py-3 px-6 bg-indigo-600/20 hover:bg-indigo-600/35 border border-indigo-500/25 text-indigo-300 rounded-2xl text-xs font-black transition-all flex items-center justify-center gap-2">
+        <!-- Action Buttons -->
+        <div class="pt-5 border-t grid grid-cols-1 sm:grid-cols-2 gap-4" style="border-color: var(--border-inner);">
+            <button onclick="fetchDecodedRawContent()" class="py-3 px-6 btn-primary rounded-2xl text-xs font-black transition-all flex items-center justify-center gap-2">
                 <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
-                Retrieve Parsed Content
+                <span data-i18n="parsedContent">Retrieve Parsed Content</span>
             </button>
-            <button onclick="window.print()" class="py-3 px-6 bg-slate-800/80 hover:bg-slate-700 text-slate-300 rounded-2xl text-xs font-bold transition-all flex items-center justify-center gap-2">
+            <button onclick="window.print()" class="py-3 px-6 btn-secondary rounded-2xl text-xs font-bold transition-all flex items-center justify-center gap-2">
                 <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h10a2 2 0 002-2v-3a2 2 0 00-2-2H9a2 2 0 00-2 2v3a2 2 0 002 2zm5-11h.01"></path></svg>
-                Print Config Card
+                <span data-i18n="printConfig">Print Config Card</span>
             </button>
         </div>
     </div>
 
     <!-- QR Code Modal -->
-    <div id="qr-modal" class="fixed inset-0 bg-black/70 backdrop-blur-md z-50 hidden items-center justify-center p-4">
-        <div class="bg-slate-900 border border-indigo-500/30 rounded-3xl max-w-sm w-full p-6 text-center space-y-4">
-            <h3 id="qr-title" class="text-lg font-black text-white">Scan Code</h3>
+    <div id="qr-modal" class="fixed inset-0 modal-overlay backdrop-blur-md z-50 hidden items-center justify-center p-4">
+        <div class="modal-card rounded-3xl max-w-sm w-full p-6 text-center space-y-4">
+            <h3 id="qr-title" class="text-lg font-black" style="color: var(--text-primary);"></h3>
             <div class="bg-white p-4 rounded-2xl inline-block mx-auto">
                 <img id="qr-img" src="" alt="QR Code" class="w-48 h-48">
             </div>
-            <p id="qr-text" class="text-[10px] font-mono text-slate-400 break-all bg-slate-950 p-3 rounded-xl border border-indigo-500/10 max-h-24 overflow-y-auto"></p>
-            <button onclick="closeQRModal()" class="w-full py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-bold transition-colors">Close</button>
+            <p id="qr-text" class="text-[10px] font-mono break-all p-3 rounded-xl max-h-24 overflow-y-auto" style="color: var(--text-muted); background: var(--bg-input); border: 1px solid var(--border-inner);"></p>
+            <button onclick="closeQRModal()" class="w-full py-2.5 btn-primary rounded-xl text-xs font-bold transition-colors" data-i18n="close">Close</button>
         </div>
     </div>
 
-    <!-- Toast Success -->
-    <div id="toast" class="fixed bottom-6 left-1/2 -translate-x-1/2 px-5 py-3 bg-emerald-500 text-white rounded-xl text-xs shadow-xl opacity-0 transition-opacity duration-350 pointer-events-none font-bold">
-        Copied to clipboard successfully!
-    </div>
+    <!-- Toast -->
+    <div id="toast" class="fixed bottom-6 left-1/2 -translate-x-1/2 px-5 py-3 rounded-xl text-xs shadow-xl opacity-0 transition-opacity duration-350 pointer-events-none font-bold" style="background: var(--green-text); color: white;"></div>
 
     <script>
+        const I18N = {
+            en: {
+                totalUsage: 'Total Usage',
+                dailyUsage: 'Daily Usage',
+                expDate: 'Expiration Date',
+                calendarLocal: 'Calendar Local Time',
+                unlimitedPlan: 'Unlimited Plan',
+                noDailyLimit: 'No Daily Limit',
+                integrationTitle: 'Integration Connections',
+                integrationDesc: 'Add the correct configuration link based on your preferred format below.',
+                universalLink: 'Universal Auto-Detecting Link',
+                universalDesc: 'This URL automatically detects your client and delivers the optimal format.',
+                universalNote: 'Real-time import of complete nodes list with dynamic update.',
+                copy: 'Copy',
+                qr: 'QR',
+                parsedContent: 'Retrieve Raw Content',
+                printConfig: 'Print Config Card',
+                close: 'Close',
+                qrTitle: 'Scan QR Code',
+                copied: 'Copied to clipboard!',
+                decodedCopied: 'Decoded links copied!',
+                decodedError: 'Error fetching content',
+                used: '% Used',
+                active: 'Active',
+                paused: 'Paused',
+                expired: 'Expired',
+                limitExceeded: 'Limit Exceeded',
+                dailyLimitExceeded: 'Daily Limit Exceeded'
+            },
+            fa: {
+                totalUsage: 'مصرف کل',
+                dailyUsage: 'مصرف روزانه',
+                expDate: 'تاریخ انقضا',
+                calendarLocal: 'زمان محلی',
+                unlimitedPlan: 'طرح نامحدود',
+                noDailyLimit: 'بدون محدودیت روزانه',
+                integrationTitle: 'لینک اتصال',
+                integrationDesc: 'لینک پیکربندی مورد نظر خود را اضافه کنید.',
+                universalLink: 'لینک خودکار برای همه کلاینت‌ها',
+                universalDesc: 'این لینک کلاینت شما را شناسایی و بهترین فرمت را ارسال می‌کند.',
+                universalNote: 'دریافت لحظه‌ای لیست نودها با به‌روزرسانی پویا.',
+                copy: 'کپی',
+                qr: 'QR',
+                parsedContent: 'دریافت متن خام',
+                printConfig: 'چاپ کارت پیکربندی',
+                close: 'بستن',
+                qrTitle: 'اسکن کد QR',
+                copied: 'کپی شد!',
+                decodedCopied: 'لینک‌ها کپی شد!',
+                decodedError: 'خطا در دریافت',
+                used: '% مصرف',
+                active: 'فعال',
+                paused: 'متوقف',
+                expired: 'منقضی',
+                limitExceeded: 'از حد مجاز رد شده',
+                dailyLimitExceeded: 'از حد روزانه رد شده'
+            }
+        };
+
+        let currentLang = 'en';
+        let isDark = true;
+
+        function applyTheme() {
+            const root = document.documentElement;
+            const themeLabel = document.getElementById('theme-label');
+            if (isDark) {
+                root.classList.add('dark');
+                document.getElementById('theme-icon').textContent = '\u2600\ufe0f';
+                if (themeLabel) themeLabel.textContent = currentLang === 'fa' ? 'روشن' : 'Light';
+            } else {
+                root.classList.remove('dark');
+                document.getElementById('theme-icon').textContent = '\ud83c\udf19';
+                if (themeLabel) themeLabel.textContent = currentLang === 'fa' ? 'تاریک' : 'Dark';
+            }
+            try { localStorage.setItem('sub-theme', isDark ? 'dark' : 'light'); } catch(e) {}
+        }
+
+        function applyLang() {
+            const t = I18N[currentLang];
+            document.querySelectorAll('[data-i18n]').forEach(el => {
+                const key = el.getAttribute('data-i18n');
+                if (t[key]) el.textContent = t[key];
+            });
+            if (currentLang === 'fa') {
+                document.documentElement.setAttribute('dir', 'rtl');
+                document.documentElement.setAttribute('lang', 'fa');
+                document.getElementById('lang-icon').textContent = '\ud83c\uddee\ud83c\uddf7';
+                document.getElementById('lang-label').textContent = 'FA';
+            } else {
+                document.documentElement.setAttribute('dir', 'ltr');
+                document.documentElement.setAttribute('lang', 'en');
+                document.getElementById('lang-icon').textContent = '\ud83c\uddfa\ud83c\uddf8';
+                document.getElementById('lang-label').textContent = 'EN';
+            }
+            initStatusBadge();
+            try { localStorage.setItem('sub-lang', currentLang); } catch(e) {}
+        }
+
+        function toggleTheme() {
+            isDark = !isDark;
+            applyTheme();
+        }
+
+        function toggleLang() {
+            currentLang = currentLang === 'en' ? 'fa' : 'en';
+            applyLang();
+            applyTheme();
+        }
+
+        function initStatusBadge() {
+            const badge = document.getElementById('status-badge');
+            const t = I18N[currentLang];
+            const map = {
+                active: { en: t.active || 'Active', bg: 'var(--green-bg)', border: 'var(--green-border)', color: 'var(--green-text)' },
+                paused: { en: t.paused || 'Paused', bg: 'var(--amber-bg)', border: 'var(--amber-border)', color: 'var(--amber-text)' },
+                expired: { en: t.expired || 'Expired', bg: 'var(--red-bg)', border: 'var(--red-border)', color: 'var(--red-text)' },
+                limit: { en: t.limitExceeded || 'Limit Exceeded', bg: 'var(--red-bg)', border: 'var(--red-border)', color: 'var(--red-text)' },
+                dailyLimit: { en: t.dailyLimitExceeded || 'Daily Limit Exceeded', bg: 'var(--red-bg)', border: 'var(--red-border)', color: 'var(--red-text)' }
+            };
+            const s = map['${statusCode}'] || map.active;
+            badge.textContent = s.en;
+            badge.style.background = s.bg;
+            badge.style.borderColor = s.border;
+            badge.style.color = s.color;
+            badge.style.border = '1px solid ' + s.border;
+        }
+
         function copyLink(id) {
             const el = document.getElementById(id);
             el.select();
             navigator.clipboard.writeText(el.value);
-            showToast("Copied link successfully!");
+            showToast(I18N[currentLang].copied);
         }
 
         async function fetchDecodedRawContent() {
             try {
-                const res = await fetch("${syncRaw}");
-                if(!res.ok) throw new Error("Server response failed");
+                const res = await fetch('${syncRaw}');
+                if(!res.ok) throw new Error('Failed');
                 const base64Str = await res.text();
                 const decodedText = atob(base64Str.trim());
                 await navigator.clipboard.writeText(decodedText);
-                showToast("Decoded node links copied to clipboard!");
+                showToast(I18N[currentLang].decodedCopied);
             } catch(e) {
-                alert("Error fetching decoded content: " + e.message);
+                alert(I18N[currentLang].decodedError + ': ' + e.message);
             }
         }
 
-        function showQRModal(title, url) {
-            document.getElementById('qr-title').innerText = title;
-            document.getElementById('qr-text').innerText = url;
-            document.getElementById('qr-img').src = "https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=" + encodeURIComponent(url);
+        function showQRModal() {
+            const t = I18N[currentLang];
+            document.getElementById('qr-title').innerText = t.qrTitle;
+            document.getElementById('qr-text').innerText = '${syncNormal}';
+            document.getElementById('qr-img').src = 'https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=' + encodeURIComponent('${syncNormal}');
             document.getElementById('qr-modal').classList.remove('hidden');
             document.getElementById('qr-modal').classList.add('flex');
         }
@@ -674,25 +997,72 @@ function serveSubscriptionInfoPage(user, host, url, request) {
             t.style.opacity = '1';
             setTimeout(() => { t.style.opacity = '0'; }, 2000);
         }
-    </script>
+
+        (function init() {
+            try {
+                const savedTheme = localStorage.getItem('sub-theme');
+                if (savedTheme) isDark = savedTheme === 'dark';
+            } catch(e) {}
+            try {
+                const savedLang = localStorage.getItem('sub-lang');
+                if (savedLang && I18N[savedLang]) currentLang = savedLang;
+            } catch(e) {}
+            applyTheme();
+            applyLang();
+        })();
+    <\/script>
 </body>
 </html>`;
     return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
 }
 
+let sysConfigLoading = null;
+let sysUsageLoading = null;
+let backupIpLoading = null;
+
 async function loadSysConfig(env) {
-    let dbData = null;
+    const now = Date.now();
+
     if (env.IOT_DB) {
-        try { const stored = await d1Get(env, "sys_config"); if (stored) dbData = JSON.parse(stored); } catch (e) { }
-        try { const ustored = await d1Get(env, "sys_usage"); if (ustored) sysUsageCache = JSON.parse(ustored); } catch (e) { }
+        if (now - sysConfigCacheTime > CACHE_TTL_CONFIG) {
+            if (!sysConfigLoading) {
+                sysConfigLoading = d1Get(env, "sys_config").then(stored => {
+                    sysConfig = { ...SYSTEM_DEFAULTS, ...(stored ? JSON.parse(stored) : null) };
+                    sysConfigCacheTime = Date.now();
+                }).catch(() => {
+                    sysConfig = { ...SYSTEM_DEFAULTS };
+                    sysConfigCacheTime = Date.now();
+                }).finally(() => { sysConfigLoading = null; });
+            }
+            await sysConfigLoading;
+        }
+        if (now - sysUsageCacheTime > CACHE_TTL_USAGE) {
+            if (!sysUsageLoading) {
+                sysUsageLoading = d1Get(env, "sys_usage").then(ustored => {
+                    if (ustored) sysUsageCache = JSON.parse(ustored);
+                    else sysUsageCache = { users: {} };
+                    sysUsageCacheTime = Date.now();
+                }).catch(() => {
+                    sysUsageCache = { users: {} };
+                    sysUsageCacheTime = Date.now();
+                }).finally(() => { sysUsageLoading = null; });
+            }
+            await sysUsageLoading;
+        }
     }
-    sysConfig = { ...SYSTEM_DEFAULTS, ...dbData };
-    let externalRelayFromDb = null;
-    if (env.IOT_DB) {
-        try { externalRelayFromDb = await d1Get(env, "backup_ip"); } catch (e) { }
+
+    if (now - backupIpCacheTime > CACHE_TTL_BACKUP_IP) {
+        if (!backupIpLoading) {
+            backupIpLoading = (env.IOT_DB ? d1Get(env, "backup_ip") : Promise.resolve(null)).then(val => {
+                backupIpCache = val;
+                backupIpCacheTime = Date.now();
+            }).catch(() => {
+                backupIpCacheTime = Date.now();
+            }).finally(() => { backupIpLoading = null; });
+        }
+        await backupIpLoading;
     }
-    const defaultRelay = ["pro", "xy", "ip.cmliussss.net"].join("");
-    sysConfig.customRelay = externalRelayFromDb ?? env.RELAY_IP ?? defaultRelay;
+    sysConfig.customRelay = backupIpCache ?? env.RELAY_IP ?? "";
 }
 
 async function fetchCloudflareUsage(accountId, apiToken) {
@@ -779,7 +1149,7 @@ async function sendTelegramMessage(request, type, hostName) {
         ],
         [
             { text: `🌐 ${langCode === 'fa' ? 'English 🇺🇸' : 'فارسی 🇮🇷'}`, callback_data: "sys_lang" },
-            { text: isPaused ? locT("btn_resume") : locT("btn_pause"), callback_data: "sys_toggle_status" }
+            { text: isPaused ? `▶️ ${locT("btn_resume")}` : `⏸️ ${locT("btn_pause")}`, callback_data: "sys_toggle_status" }
         ],
         [
             { text: `🔑 ${locT("dash")}`, web_app: { url: panelUrl } }
@@ -893,7 +1263,7 @@ async function handleUsersApi(request, env, ctx) {
 
         if (method === "POST" && !userId) {
             const body = await request.json();
-            const { name, trafficLimit, expiryDays, notes, maxConfigs, proxyIp, userMode, userPorts } = body;
+            const { name, trafficLimit, expiryDays, notes, maxConfigs, proxyIp, cleanIp, userMode, userPorts, userNodes, nat64 } = body;
             if (!name) return new Response(JSON.stringify({ success: false, error: "Name is required" }), { status: 400, headers: { "Content-Type": "application/json" } });
             const newId = crypto.randomUUID();
             const newUser = {
@@ -905,13 +1275,17 @@ async function handleUsersApi(request, env, ctx) {
                 notes: notes || "",
                 maxConfigs: maxConfigs ? parseInt(maxConfigs) : null,
                 proxyIp: proxyIp || null,
+cleanIp: cleanIp || null,
                 userMode: userMode || null,
                 userPorts: userPorts || null,
+                userNodes: userNodes || null,
+                nat64: nat64 || null,
                 createdAt: Date.now()
             };
+            await resolveUserProxyIpGeo(newUser);
             if (!sysConfig.users) sysConfig.users = [];
             sysConfig.users.push(newUser);
-            await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+            await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
             ctx?.waitUntil(logActivity(env, "User Created", `User "${name}" (${newId}) created via API`).catch(()=>{}));
             const hostName = new URL(request.url).hostname;
             const subUrl = `https://${hostName}/${sysConfig.apiRoute}?sub=${encodeURIComponent(name)}`;
@@ -929,14 +1303,17 @@ async function handleUsersApi(request, env, ctx) {
             if (body.expiryDays !== undefined) u.expiryMs = body.expiryDays ? Date.now() + parseInt(body.expiryDays) * 86400000 : null;
             if (body.notes !== undefined) u.notes = body.notes;
             if (body.maxConfigs !== undefined) u.maxConfigs = body.maxConfigs ? parseInt(body.maxConfigs) : null;
-            if (body.proxyIp !== undefined) u.proxyIp = body.proxyIp;
+            if (body.proxyIp !== undefined) { u.proxyIp = body.proxyIp; if (!body.proxyIp) { u.proxyIpGeo = null; } else { await resolveUserProxyIpGeo(u); } }
+            if (body.cleanIp !== undefined) u.cleanIp = body.cleanIp;
             if (body.userMode !== undefined) u.userMode = body.userMode;
             if (body.userPorts !== undefined) u.userPorts = body.userPorts;
+            if (body.userNodes !== undefined) u.userNodes = body.userNodes;
+            if (body.nat64 !== undefined) u.nat64 = body.nat64;
             if (body.status !== undefined) {
                 if (body.status === "active") { u.isPaused = false; u.disabledReason = null; u.disabledAt = null; }
                 else if (body.status === "paused") { u.isPaused = true; u.disabledReason = null; u.disabledAt = null; }
             }
-            await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+            await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
             ctx?.waitUntil(logActivity(env, "User Updated", `User "${u.name}" (${userId}) updated via API`).catch(()=>{}));
             return new Response(JSON.stringify({ success: true, user: u }), { headers: { "Content-Type": "application/json" } });
         }
@@ -946,7 +1323,7 @@ async function handleUsersApi(request, env, ctx) {
             const idx = sysConfig.users.findIndex(usr => usr.id === userId);
             if (idx === -1) return new Response(JSON.stringify({ success: false, error: "User not found" }), { status: 404, headers: { "Content-Type": "application/json" } });
             const deleted = sysConfig.users.splice(idx, 1)[0];
-            await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+            await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
             ctx?.waitUntil(logActivity(env, "User Deleted", `User "${deleted.name}" (${userId}) deleted via API`).catch(()=>{}));
             return new Response(JSON.stringify({ success: true, deleted: deleted.id }), { headers: { "Content-Type": "application/json" } });
         }
@@ -957,7 +1334,7 @@ async function handleUsersApi(request, env, ctx) {
             if (!u) return new Response(JSON.stringify({ success: false, error: "User not found" }), { status: 404, headers: { "Content-Type": "application/json" } });
             u.isPaused = !u.isPaused;
             if (!u.isPaused) { u.disabledReason = null; u.disabledAt = null; }
-            await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+            await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
             ctx?.waitUntil(logActivity(env, "User Toggled", `User "${u.name}" (${userId}) ${u.isPaused ? 'paused' : 'resumed'} via API`).catch(()=>{}));
             return new Response(JSON.stringify({ success: true, user: u }), { headers: { "Content-Type": "application/json" } });
         }
@@ -972,7 +1349,7 @@ async function handleUsersApi(request, env, ctx) {
             } else {
                 sysUsageCache.users[uuidClean] = { reqs: 0, dReqs: 0, lastDay: new Date().toISOString().split('T')[0] };
             }
-            await d1Put(env, "sys_usage", JSON.stringify(sysUsageCache));
+            await cachedD1Put(env, "sys_usage", JSON.stringify(sysUsageCache));
             ctx?.waitUntil(logActivity(env, "Traffic Reset", `Traffic reset for user ${userId} via API`).catch(()=>{}));
             return new Response(JSON.stringify({ success: true, message: "Traffic reset" }), { headers: { "Content-Type": "application/json" } });
         }
@@ -1018,6 +1395,110 @@ async function handleStatsApi(request, env) {
             }
         }), { headers: { "Content-Type": "application/json" } });
     } catch (e) { return new Response(JSON.stringify({ success: false, error: e.message }), { status: 500, headers: { "Content-Type": "application/json" } }); }
+}
+
+function cmpVersions(a, b) {
+    const strip = v => String(v).replace(/^v/, '').trim();
+    const pa = strip(a).split('.').map(Number);
+    const pb = strip(b).split('.').map(Number);
+    for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+        let na = pa[i] || 0, nb = pb[i] || 0;
+        if (na > nb) return 1;
+        if (nb > na) return -1;
+    }
+    return 0;
+}
+
+async function handleUpdateApi(request, env, ctx) {
+    try {
+        if (request.method !== "POST") return new Response("405", { status: 405 });
+        const data = await request.json();
+        if (data.key !== sysConfig.masterKey) {
+            return new Response(JSON.stringify({ success: false, error: "Unauthorized" }), { status: 401, headers: { "Content-Type": "application/json" } });
+        }
+
+        const accountId = sysConfig.cfAccountId;
+        const apiToken = sysConfig.cfApiToken;
+        const workerName = sysConfig.cfWorkerName;
+        const repo = (sysConfig.githubRepo || "itsyebekhe/nahan").replace(/https?:\/\/github\.com\//, '').trim();
+
+        if (data.action === "check") {
+            let remoteVer = null;
+            try {
+                const res = await fetch(`https://raw.githubusercontent.com/${repo}/main/version`);
+                if (res.ok) {
+                    const txt = (await res.text()).trim();
+                    if (txt && txt.length <= 15) remoteVer = txt;
+                }
+            } catch(e) {}
+            if (!remoteVer) {
+                try {
+                    const res = await fetch(`https://raw.githubusercontent.com/${repo}/main/_worker.js`);
+                    if (res.ok) {
+                        const code = await res.text();
+                        const match = code.match(/const\s+CURRENT_VERSION\s*=\s*["']([^"']+)["']/);
+                        if (match) remoteVer = match[1];
+                    }
+                } catch(e) {}
+            }
+            if (!remoteVer) {
+                return new Response(JSON.stringify({ success: false, error: "Could not fetch remote version" }), { status: 502, headers: { "Content-Type": "application/json" } });
+            }
+            const hasCredentials = !!(accountId && apiToken && workerName);
+            return new Response(JSON.stringify({
+                success: true, current: CURRENT_VERSION, latest: remoteVer,
+                updateAvailable: cmpVersions(CURRENT_VERSION, remoteVer) < 0,
+                canDeploy: hasCredentials
+            }), { headers: { "Content-Type": "application/json" } });
+        }
+
+        if (data.action === "deploy") {
+            if (!accountId || !apiToken || !workerName) {
+                return new Response(JSON.stringify({ success: false, error: "CF credentials not configured" }), { status: 400, headers: { "Content-Type": "application/json" } });
+            }
+
+            let finalCodeToDeploy = data.code;
+            if (!finalCodeToDeploy) {
+                try {
+                    const res = await fetch(`https://raw.githubusercontent.com/${repo}/main/_worker.js`);
+                    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                    finalCodeToDeploy = await res.text();
+                } catch(e) {
+                    return new Response(JSON.stringify({ success: false, error: "Failed to fetch code from GitHub: " + e.message }), { status: 502, headers: { "Content-Type": "application/json" } });
+                }
+            }
+
+            const versionMatch = finalCodeToDeploy.match(/const\s+CURRENT_VERSION\s*=\s*["']([^"']+)["']/);
+            const newVersion = versionMatch ? versionMatch[1] : CURRENT_VERSION;
+
+            if (cmpVersions(CURRENT_VERSION, newVersion) >= 0 && !data.force && !data.code) {
+                return new Response(JSON.stringify({ success: false, error: "Remote version is not newer. Click force redeploy to switch formats or overwrite." }), { status: 400, headers: { "Content-Type": "application/json" } });
+            }
+
+            const deployRes = await deployWorkerToCloudflare(accountId, apiToken, workerName, finalCodeToDeploy);
+            const deployResult = await deployRes.json();
+
+            if (deployResult.success) {
+                ctx?.waitUntil(logActivity(env, "Panel Updated", `v${CURRENT_VERSION} → v${newVersion}`).catch(()=>{}));
+                if (sysConfig.tgToken && (sysConfig.tgAdminId || sysConfig.tgChatId)) {
+                    const tgMsg = `🔄 <b>Panel Updated</b>\n\n📦 v${CURRENT_VERSION} → v${newVersion}`;
+                    const notifyChatId = sysConfig.tgAdminId || sysConfig.tgChatId;
+                    ctx?.waitUntil(fetch(`https://api.telegram.org/bot${sysConfig.tgToken}/sendMessage`, {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ chat_id: notifyChatId, text: tgMsg, parse_mode: 'HTML' })
+                    }).catch(()=>{}));
+                }
+                return new Response(JSON.stringify({ success: true, message: `Updated to v${newVersion}`, newVersion }), { headers: { "Content-Type": "application/json" } });
+            } else {
+                const errMsg = deployResult.errors?.[0]?.message || "Unknown API error";
+                return new Response(JSON.stringify({ success: false, error: "Cloudflare API: " + errMsg }), { status: 502, headers: { "Content-Type": "application/json" } });
+            }
+        }
+
+        return new Response(JSON.stringify({ success: false, error: "Invalid action" }), { status: 400, headers: { "Content-Type": "application/json" } });
+    } catch(e) {
+        return new Response(JSON.stringify({ success: false, error: e.message }), { status: 500, headers: { "Content-Type": "application/json" } });
+    }
 }
 
 async function handleAuth(request, hostName, ctx, env) {
@@ -1109,13 +1590,32 @@ async function handleConfigSync(request, env, ctx) {
                              (data.oldKey && data.oldKey === sysConfig.masterKey) || 
                              (sysConfig.masterKey === "admin");
         if (!isAuthorized) return new Response(JSON.stringify({ success: false }), { status: 401 });
+        if (data.fromMaster && !sysConfig.allowSyncWorker) {
+    return new Response(JSON.stringify({ success: false, error: "Sync not allowed" }), { status: 403 });
+}
         if (!env.IOT_DB) return new Response(JSON.stringify({ success: false, msg: "DB Error" }), { status: 400 });
         
         let nextConfig = sysConfig;
         if (data.config) {
             nextConfig = { ...sysConfig, ...data.config };
+            if (Array.isArray(nextConfig.users) && nextConfig.users.length > 0) {
+                const geoPromises = nextConfig.users.map(async (u) => {
+                    if (u.proxyIp) {
+                        await resolveUserProxyIpGeo(u);
+                    } else {
+                        u.proxyIpGeo = null;
+                    }
+                });
+                await Promise.all(geoPromises);
+            }
             sysConfig = nextConfig;
-            await d1Put(env, "sys_config", JSON.stringify(nextConfig));
+            await cachedD1Put(env, "sys_config", JSON.stringify(nextConfig));
+        }
+
+        let tagWarning = null;
+        if (nextConfig.nameStrategy && nextConfig.nameStrategy.includes('{') && nextConfig.nameStrategy.includes('}')) {
+            let vResult = validateNameStrategy(nextConfig.nameStrategy);
+            if (!vResult.valid) tagWarning = `Unknown tags detected: ${vResult.unknownTags.join(', ')}`;
         }
 
         if (data.resetUUID) {
@@ -1128,7 +1628,7 @@ async function handleConfigSync(request, env, ctx) {
             } else {
                 sysUsageCache.users[uuidClean] = { reqs: 0, dReqs: 0, lastDay: new Date().toISOString().split('T')[0] };
             }
-            await d1Put(env, "sys_usage", JSON.stringify(sysUsageCache));
+            await cachedD1Put(env, "sys_usage", JSON.stringify(sysUsageCache));
         }
 
         const oldMasterKey = sysConfig.masterKey;
@@ -1155,11 +1655,11 @@ async function handleConfigSync(request, env, ctx) {
             }).catch(()=>{}));
         }
 
-        return new Response(JSON.stringify({ success: true, newRoute: nextConfig.apiRoute }), { status: 200 });
+        return new Response(JSON.stringify({ success: true, newRoute: nextConfig.apiRoute, tagWarning }), { status: 200 });
     } catch (e) { return new Response(JSON.stringify({ success: false }), { status: 400 }); }
 }
 
-async function handleSyncPanel(request, env) {
+async function handleSyncPanel(request, env, ctx) {
     try {
         const data = await request.json();
         if (!data.signal || data.signal !== "panel_login") {
@@ -1182,7 +1682,7 @@ async function handleSyncPanel(request, env) {
             ts: data.ts || Date.now()
         };
         if (env.IOT_DB) {
-            await d1Put(env, "tg_panel_login", JSON.stringify(loginSignal));
+            ctx?.waitUntil(d1Put(env, "tg_panel_login", JSON.stringify(loginSignal)).catch(()=>{}));
         }
         return new Response(JSON.stringify({ success: true }), { status: 200 });
     } catch (e) {
@@ -1193,15 +1693,15 @@ async function handleSyncPanel(request, env) {
 const botI18n = {
     en: {
         welcome: "🤖 **Welcome to Nahan Gateway Bot**\nSelect your option below to manage your system:",
-        status: "📊 System Status",
-        users: "👥 Subscribers",
-        metrics: "📡 Gateway Health",
-        panic: "🚨 Panic Mode",
-        dash: "🔑 Dashboard Control",
+        status: "System Status",
+        users: "Subscribers",
+        metrics: "Gateway Health",
+        panic: "Panic Mode",
+        dash: "Dashboard Control",
         lang: "🌐 Change Language",
         active: "🟢 Active",
         paused: "🔴 Paused",
-        uptime: "⏱ Uptime",
+        uptime: "Uptime",
         streams: "📡 Active Streams",
         no_users: "No subscribers found.",
         sub_info: "👤 Subscriber Details:",
@@ -1214,14 +1714,14 @@ const botI18n = {
         unlimited: "Unlimited",
         btn_back: "◀️ Back",
         btn_next: "▶️ Next",
-        btn_del: "🗑️ Delete",
-        btn_pause: "⏸️ Pause",
-        btn_resume: "▶️ Resume",
-        btn_edit_name: "✏️ Change Name",
-        btn_edit_limits: "⚙️ Limits",
+        btn_del: "Delete",
+        btn_pause: "Pause",
+        btn_resume: "Resume",
+        btn_edit_name: "Change Name",
+        btn_edit_limits: "Limits",
         btn_add: "+ Add Subscriber",
-        btn_confirm: "✅ Confirm",
-        btn_cancel: "❌ Cancel",
+        btn_confirm: "Confirm",
+        btn_cancel: "Cancel",
         msg_enter_name: "Please send a name for the subscriber:",
         msg_added: "Sub added successfully! 🎉",
         msg_deleted: "Sub deleted successfully! 🗑️",
@@ -1230,25 +1730,26 @@ const botI18n = {
         msg_enter_limits: "Enter limits format:\n`[totalReqs] [dailyReqs] [days_limit]`\n(Use 0 for unlimited)\n\nExample:\n`10000 500 30`",
         msg_confirm_del: "⚠️ Are you sure you want to delete this subscriber?",
         msg_confirm_panic: "⚠️ Are you absolutely sure you want to trigger PANIC mode? This will randomize API routes and pause all connections!",
-        status_updated: "Status updated! 🔁",
-        access_denied: "❌ Access Denied. You are not authorized to manage this panel.",
-        dashboard: "📊 Dashboard",
-        search: "🔍 Search User",
-        statistics: "📈 Statistics",
-        panel_info: "ℹ️ Panel Info",
-        disabled_users: "🚫 Disabled Users",
-        reset_traffic: "🔄 Reset Traffic",
-        extend_expiry: "📅 Extend Expiry",
-        notes: "📝 Notes",
-        device_limit: "📱 Device Limit",
+        status_updated: "Status updated!",
+        access_denied: "Access Denied. You are not authorized to manage this panel.",
+        dashboard: "Dashboard",
+        search: "Search User",
+        statistics: "Statistics",
+        panel_info: "Panel Info",
+        disabled_users: "Disabled Users",
+        reset_traffic: "Reset Traffic",
+        extend_expiry: "Extend Expiry",
+        notes: "Notes",
+        device_limit: "Config Limit",
         msg_enter_search: "🔍 Send a username, UUID, or subscription to search:",
         msg_enter_notes: "📝 Send notes for this user:",
         msg_enter_extend_days: "📅 Enter number of days to extend expiration:",
-        msg_traffic_reset: "✅ Traffic has been reset successfully!",
-        msg_expiry_extended: "✅ Expiration extended by {days} days!",
+        msg_traffic_reset: "Traffic has been reset successfully!",
+        msg_expiry_extended: "Expiration extended by {days} days!",
         msg_no_disabled: "No disabled users found.",
-        msg_enter_device_limit: "📱 Enter device limit (0 for unlimited):",
-        stats_title: "📈 Panel Statistics",
+        msg_enter_device_limit: "Enter config limit (0 for unlimited):",
+        config_limit_updated: "Config limit updated!",
+        stats_title: "Panel Statistics",
         count_active: "active",
         count_paused: "paused",
         count_disabled: "auto-disabled",
@@ -1257,8 +1758,8 @@ const botI18n = {
         dash_paused: "Paused",
         dash_expired: "Expired",
         dash_auto_disabled: "Auto-Disabled",
-        btn_main_menu: "🔙 Main Menu",
-        btn_back_to_list: "🔙 Back to List",
+        btn_main_menu: "Main Menu",
+        btn_back_to_list: "Back to List",
         total_traffic: "Total Traffic",
         daily_traffic: "Daily Traffic",
         lbl_status: "Status",
@@ -1274,21 +1775,39 @@ const botI18n = {
         msg_panel_selected: "Panel selected! ✅",
         msg_panel_error: "❌ Failed to connect to the selected panel.",
         msg_panel_unreachable: "⚠️ Panel is unreachable. Please check the configuration.",
-        btn_sub_link: "🔗 Subscription Link",
-        sub_link_sent: "✅ Subscription link sent!",
-        btn_update_usage: "🔄 Update Usage",
+        btn_sub_link: "Subscription Link",
+        sub_link_sent: "Subscription link sent!",
+        btn_update_usage: "Update Usage",
+        tg_settings: "Settings", tg_advanced: "Advanced", tg_logs: "Logs",
+        tg_sys_settings: "System Settings", tg_adv_settings: "Advanced Settings",
+        tg_logs_view: "View Logs", tg_logs_clear: "Clear Logs",
+        tg_proto: "Protocol", tg_ports: "Ports", tg_uuid: "Device UUID", tg_path: "API Route",
+        tg_pass: "Master Key", tg_dns: "DNS", tg_relay: "Relay IP", tg_maintenance: "Maintenance Hosts",
+        tg_tfo: "TCP Fast Open", tg_ech: "ECH", tg_silent: "Silent Alerts", tg_pause: "Kill Switch",
+        tg_auto_update: "Auto Update", tg_direct: "Direct Configs", tg_nat64: "NAT64",
+        tg_clean_ips: "Clean IPs", tg_nodes: "Nodes", tg_strategy: "Name Strategy",
+        tg_prefix: "Name Prefix", tg_fake_entries: "Fake Entries", tg_cf_settings: "Cloudflare Settings",
+        tg_tg_settings: "Telegram Settings", tg_backup: "Backup", tg_restore: "Restore",
+        tg_current_val: "Current Value", tg_new_val: "Send new value:",
+        tg_saved: "Saved!", tg_cancelled: "Cancelled",
+        tg_log_entry: "", tg_log_empty: "No logs found",
+        tg_u_custom_name: "Custom Name", tg_u_clean_ips: "Clean IPs", tg_u_proxy_ips: "Proxy IPs",
+        tg_u_nodes: "Nodes", tg_u_nat64: "NAT64", tg_u_mode: "Protocol Mode", tg_u_ports: "Ports",
+        tg_u_max_cfg: "Max Configs", tg_u_all: "All Settings",
+        tg_network: "Network", tg_uptime: "Uptime", tg_conns: "Active Connections",
+        tg_version: "Version", tg_cf_usage: "CF Usage",
     },
     fa: {
         welcome: "🤖 **به ربات ترانزیت نهان خوش آمدید**\nجهت مدیریت سیستم نظارتی خود یکی از گزینه‌های زیر را انتخاب نمایید:",
-        status: "📊 وضعیت سیستم",
-        users: "👥 مدیریت مشترکین",
-        metrics: "📡 سلامت درگاه شبکه",
-        panic: "🚨 وضعیت اضطراری (Panic)",
-        dash: "🔑 پنل تحت وب",
+        status: "وضعیت سیستم",
+        users: "مدیریت مشترکین",
+        metrics: "سلامت درگاه شبکه",
+        panic: "وضعیت اضطراری (Panic)",
+        dash: "پنل تحت وب",
         lang: "🌐 تغییر زبان به انگلیسی",
         active: "🟢 فعال",
         paused: "🔴 متوقف شده",
-        uptime: "⏱ مدت زمان کارکرد",
+        uptime: "زمان کارکرد",
         streams: "📡 اتصالات فعال",
         no_users: "هیچ مشترکی پیدا نشد.",
         sub_info: "👤 مشخصات مشترک:",
@@ -1299,43 +1818,44 @@ const botI18n = {
         days: "روزهای باقی‌مانده",
         created: "تاریخ ایجاد",
         unlimited: "نامحدود",
-        btn_back: "◀️ بازگشت",
-        btn_next: "▶️ بعدی",
-        btn_del: "🗑️ حذف",
-        btn_pause: "⏸️ غیرفعال‌سازی",
-        btn_resume: "▶️ فعال‌سازی",
-        btn_edit_name: "✏️ تغییر نام",
-        btn_edit_limits: "⚙️ ویرایش محدودیت‌ها",
+        btn_back: "بازگشت",
+        btn_next: "بعدی",
+        btn_del: "حذف",
+        btn_pause: "غیرفعال‌سازی",
+        btn_resume: "فعال‌سازی",
+        btn_edit_name: "تغییر نام",
+        btn_edit_limits: "ویرایش محدودیت‌ها",
         btn_add: "+ افزودن مشترک جدید",
-        btn_confirm: "✅ تأیید",
-        btn_cancel: "❌ انصراف",
+        btn_confirm: "تأیید",
+        btn_cancel: "انصراف",
         msg_enter_name: "لطفاً نام یا شناسه مشترک جدید را ارسال نمایید:",
-        msg_added: "مشترک با موفقیت افزوده شد! 🎉",
-        msg_deleted: "مشترک با موفقیت حذف گردید! 🗑️",
-        msg_panic: "🚨 وضعیت اضطراری فعال شد 🚨\nمسیر تصادفی شد و سیستم متوقف گردید.",
+        msg_added: "مشترک با موفقیت افزوده شد!",
+        msg_deleted: "مشترک با موفقیت حذف گردید!",
+        msg_panic: "وضعیت اضطراری فعال شد\nمسیر تصادفی شد و سیستم متوقف گردید.",
         msg_invalid: "ورودی نامعتبر است. مجدداً تلاش نمایید.",
         msg_enter_limits: "فرمت ورودی محدودیت:\n`[کل] [روزانه] [مدت_روز]`\n(از 0 برای نامحدود استفاده کنید)\n\nمثال:\n`10000 500 30`",
-        msg_confirm_del: "⚠️ آیا از حذف این مشترک اطمینان کامل دارید؟",
-        msg_confirm_panic: "⚠️ آیا از فعال‌سازی وضعیت اضطراری اطمینان دارید؟ کل اتصالات متوقف و آدرس‌ها منقضی خواهند شد!",
-        status_updated: "وضعیت بروزرسانی شد! 🔁",
-        access_denied: "❌ دسترسی غیرمجاز. شما اجازه مدیریت این پنل را ندارید.",
-        dashboard: "📊 داشبورد",
-        search: "🔍 جستجوی کاربر",
-        statistics: "📈 آمار",
-        panel_info: "ℹ️ اطلاعات پنل",
-        disabled_users: "🚫 کاربران غیرفعال",
-        reset_traffic: "🔄 بازنشانی ترافیک",
-        extend_expiry: "📅 تمدید انقضا",
-        notes: "📝 یادداشت‌ها",
-        device_limit: "📱 محدودیت دستگاه",
+        msg_confirm_del: "آیا از حذف این مشترک اطمینان کامل دارید؟",
+        msg_confirm_panic: "آیا از فعال‌سازی وضعیت اضطراری اطمینان دارید؟ کل اتصالات متوقف و آدرس‌ها منقضی خواهند شد!",
+        status_updated: "وضعیت بروزرسانی شد!",
+        access_denied: "دسترسی غیرمجاز. شما اجازه مدیریت این پنل را ندارید.",
+        dashboard: "داشبورد",
+        search: "جستجوی کاربر",
+        statistics: "آمار",
+        panel_info: "اطلاعات پنل",
+        disabled_users: "کاربران غیرفعال",
+        reset_traffic: "بازنشانی ترافیک",
+        extend_expiry: "تمدید انقضا",
+        notes: "یادداشت‌ها",
+        device_limit: "محدودیت کانفیگ",
         msg_enter_search: "🔍 نام کاربری، UUID یا لینک اشتراک را ارسال کنید:",
         msg_enter_notes: "📝 یادداشت برای این کاربر را ارسال کنید:",
         msg_enter_extend_days: "📅 تعداد روزهای تمدید را وارد کنید:",
-        msg_traffic_reset: "✅ ترافیک با موفقیت بازنشانی شد!",
-        msg_expiry_extended: "✅ انقضا به مدت {days} روز تمدید شد!",
+        msg_traffic_reset: "ترافیک با موفقیت بازنشانی شد!",
+        msg_expiry_extended: "انقضا به مدت {days} روز تمدید شد!",
         msg_no_disabled: "هیچ کاربر غیرفعالی یافت نشد.",
-        msg_enter_device_limit: "📱 محدودیت دستگاه را وارد کنید (0 برای نامحدود):",
-        stats_title: "📈 آمار پنل",
+        msg_enter_device_limit: "محدودیت تعداد کانفیگ را وارد کنید (0 برای نامحدود):",
+        config_limit_updated: "محدودیت کانفیگ به‌روزرسانی شد!",
+        stats_title: "آمار پنل",
         count_active: "فعال",
         count_paused: "متوقف",
         count_disabled: "غیرفعال خودکار",
@@ -1344,8 +1864,8 @@ const botI18n = {
         dash_paused: "متوقف",
         dash_expired: "منقضی",
         dash_auto_disabled: "غیرفعال خودکار",
-        btn_main_menu: "🔙 منوی اصلی",
-        btn_back_to_list: "🔙 بازگشت به لیست",
+        btn_main_menu: "منوی اصلی",
+        btn_back_to_list: "بازگشت به لیست",
         total_traffic: "ترافیک کل",
         daily_traffic: "ترافیک روزانه",
         lbl_status: "وضعیت",
@@ -1361,9 +1881,27 @@ const botI18n = {
         msg_panel_selected: "پنل انتخاب شد! ✅",
         msg_panel_error: "❌ اتصال به پنل انتخابی ناموفق بود.",
         msg_panel_unreachable: "⚠️ پنل در دسترس نیست. لطفاً پیکربندی را بررسی کنید.",
-        btn_sub_link: "🔗 لینک اشتراک",
-        sub_link_sent: "✅ لینک اشتراک ارسال شد!",
-        btn_update_usage: "🔄 بروزرسانی مصرف",
+        btn_sub_link: "لینک اشتراک",
+        sub_link_sent: "لینک اشتراک ارسال شد!",
+        btn_update_usage: "بروزرسانی مصرف",
+        tg_settings: "تنظیمات", tg_advanced: "پیشرفته", tg_logs: "گزارش‌ها",
+        tg_sys_settings: "تنظیمات سیستم", tg_adv_settings: "تنظیمات پیشرفته",
+        tg_logs_view: "مشاهده گزارش‌ها", tg_logs_clear: "پاک کردن گزارش‌ها",
+        tg_proto: "پروتکل", tg_ports: "پورت‌ها", tg_uuid: "شناسه دستگاه", tg_path: "مسیر API",
+        tg_pass: "کلید اصلی", tg_dns: "DNS", tg_relay: "آی‌پی رله", tg_maintenance: "سایت استتار",
+        tg_tfo: "TCP Fast Open", tg_ech: "ECH", tg_silent: "هشدار خاموش", tg_pause: "کلید توقف",
+        tg_auto_update: "بروزرسانی خودکار", tg_direct: "کانفیگ مستقیم", tg_nat64: "NAT64",
+        tg_clean_ips: "آی‌پی تمیز", tg_nodes: "نودها", tg_strategy: "روش نام‌گذاری",
+        tg_prefix: "پیشوند", tg_fake_entries: "ورودی‌های اشتراک", tg_cf_settings: "تنظیمات کلودفلر",
+        tg_tg_settings: "تنظیمات تلگرام", tg_backup: "پشتیبان‌گیری", tg_restore: "بازیابی",
+        tg_current_val: "مقدار فعلی", tg_new_val: "مقدار جدید را ارسال کنید:",
+        tg_saved: "ذخیره شد!", tg_cancelled: "لغو شد",
+        tg_log_entry: "", tg_log_empty: "گزارشی ثبت نشده",
+        tg_u_custom_name: "نام سفارشی", tg_u_clean_ips: "آی‌پی تمیز", tg_u_proxy_ips: "آی‌پی پروکسی",
+        tg_u_nodes: "نودها", tg_u_nat64: "NAT64", tg_u_mode: "پروتکل", tg_u_ports: "پورت‌ها",
+        tg_u_max_cfg: "حداکثر کانفیگ", tg_u_all: "همه تنظیمات",
+        tg_network: "شبکه", tg_uptime: "زمان کارکرد", tg_conns: "اتصالات فعال",
+        tg_version: "نسخه", tg_cf_usage: "مصرف کلودفلر",
     }
 };
 
@@ -1569,10 +2107,17 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                 inline_keyboard.push([
                     { text: `🚫 ${t("disabled_users")}`, callback_data: "subs_disabled:0" }
                 ]);
+                inline_keyboard.push([
+                    { text: `⚙️ ${t("tg_settings")}`, callback_data: "tg_settings_menu" },
+                    { text: `🔧 ${t("tg_advanced")}`, callback_data: "tg_advanced_menu" }
+                ]);
+                inline_keyboard.push([
+                    { text: `📋 ${t("tg_logs")}`, callback_data: "tg_logs_menu" }
+                ]);
             }
             inline_keyboard.push([
                 { text: `🌐 ${langCode === 'fa' ? 'English 🇺🇸' : 'فارسی 🇮🇷'}`, callback_data: "sys_lang" },
-                { text: isPaused ? t("btn_resume") : t("btn_pause"), callback_data: "sys_toggle_status" }
+                { text: isPaused ? `▶️ ${t("btn_resume")}` : `⏸️ ${t("btn_pause")}`, callback_data: "sys_toggle_status" }
             ]);
             if (panelUrl) {
                 inline_keyboard.push([
@@ -1671,6 +2216,12 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
             const subSync = `https://${hostName}/${sysConfig.apiRoute}?sub=${encodeURIComponent(u.name)}`;
             const maxCfgTxt = u.maxConfigs || t("unlimited");
             const notesTxt = u.notes || t("lbl_none");
+            const modeTxt = u.userMode ? (u.userMode === 'alpha' ? 'Alpha (V)' : u.userMode === 'beta' ? 'Beta (T)' : 'Both') : t("unlimited");
+            const portsTxt = u.userPorts || t("unlimited");
+            const cleanIpsTxt = u.cleanIp ? u.cleanIp.substring(0, 30) + (u.cleanIp.length > 30 ? '...' : '') : '—';
+            const proxyIpsTxt = u.proxyIp ? u.proxyIp.substring(0, 30) + (u.proxyIp.length > 30 ? '...' : '') : '—';
+            const nodesTxt = u.userNodes ? u.userNodes.substring(0, 30) + (u.userNodes.length > 30 ? '...' : '') : '—';
+            const nat64Txt = u.nat64 || '—';
             
             let text = `👤 **${t("sub_info")}**\n`;
             text += `━━━━━━━━━━━━━━━━\n`;
@@ -1681,7 +2232,13 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
             text += `⏱ **${t("daily")}**: ${userDReqs} / ${limitDailyTxt}\n`;
             text += `📅 **${t("expiry")}**: ${expTxt}\n`;
             text += `⏳ **${t("days")}**: ${daysLeft}\n`;
+            text += `📡 **${t("tg_u_mode")}**: ${modeTxt}\n`;
+            text += `🔌 **${t("tg_u_ports")}**: ${portsTxt}\n`;
             text += `📱 **${t("device_limit")}**: ${maxCfgTxt}\n`;
+            text += `🧹 **${t("tg_u_clean_ips")}**: ${cleanIpsTxt}\n`;
+            text += `🔗 **${t("tg_u_proxy_ips")}**: ${proxyIpsTxt}\n`;
+            text += `🖥️ **${t("tg_u_nodes")}**: ${nodesTxt}\n`;
+            text += `🌐 **${t("tg_u_nat64")}**: ${nat64Txt}\n`;
             text += `📝 **${t("notes")}**: ${notesTxt}\n`;
             text += `━━━━━━━━━━━━━━━━\n`;
             text += `🔗 **${t("lbl_subscription")}:**\n\`${subSync}\``;
@@ -1719,6 +2276,15 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
             const data = cb.data;
 
             if (chatId) {
+                if (!isAuthorized) {
+                    await fetch(`${tgApi}/answerCallbackQuery`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ callback_query_id: cb.id, text: t("access_denied"), show_alert: true })
+                    });
+                    return new Response("OK", { status: 200 });
+                }
+
                 // Get active panel from last login signal
                 const activePanel = getActivePanel();
                 const isRemotePanel = activePanel && !activePanel.isLocal;
@@ -1734,32 +2300,21 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
 
                 // Clear step state on callback query
                 tgState[chatId] = null;
-                await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
 
                 let answerText = null;
-
-                const adminOnlyActions = ["subs_list:", "sub_detail:", "sub_toggle:", "sub_del_init:", "sub_del_confirm:", "sub_add_init", "sub_add_unlimited_skip", "sub_edit_name_init:", "sub_edit_limits_init:", "sub_unlimit_cb:", "sub_reset_traffic:", "sub_extend_init:", "sub_edit_notes_init:", "sub_edit_device_init:", "sub_device_unlimited:", "subs_disabled:", "sub_search_init", "sys_panic_init", "sys_panic_confirm"];
-                const isAdminAction = adminOnlyActions.some(a => data === a || data.startsWith(a));
-                if (isAdminAction && !isAuthorized) {
-                    await fetch(`${tgApi}/answerCallbackQuery`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ callback_query_id: cb.id, text: t("access_denied"), show_alert: true })
-                    });
-                    return new Response("OK", { status: 200 });
-                }
 
                 if (data === "main_menu") {
                     const menu = getMainMenu(activePanel, isAuthorized);
                     await sendOrEdit(chatId, menu.text, menu.kb, messageId);
                 } else if (data === "sys_lang") {
                     sysConfig.tgBotLang = (langCode === "fa") ? "en" : "fa";
-                    await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+                    await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
                     const menu = getMainMenu(activePanel, isAuthorized);
                     await sendOrEdit(chatId, menu.text, menu.kb, messageId);
                 } else if (data === "sys_toggle_status") {
                     sysConfig.isPaused = !sysConfig.isPaused;
-                    await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+                    await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
                     const menu = getMainMenu(activePanel, isAuthorized);
                     await sendOrEdit(chatId, menu.text, menu.kb, messageId);
                 } else if (data === "sys_metrics") {
@@ -1810,7 +2365,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         const u = sysConfig.users.find(usr => usr.id === uuid);
                         if (u) {
                             u.isPaused = !u.isPaused;
-                            await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+                            await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
                         }
                     }
                     const panelUsers = await getPanelUsers();
@@ -1837,28 +2392,28 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         await remotePanelWriteAction(activePanel, 'DELETE', uuid);
                     } else if (sysConfig.users) {
                         sysConfig.users = sysConfig.users.filter(usr => usr.id !== uuid);
-                        await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+                        await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
                     }
                     const successText = `✅ ${t("msg_deleted")}`;
                     const kb = { inline_keyboard: [[{ text: t("btn_back"), callback_data: "subs_list:0" }]] };
                     await sendOrEdit(chatId, successText, kb, messageId);
                 } else if (data === "sub_add_init") {
                     tgState[chatId] = { step: "sub_add_name" };
-                    await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
                     const text = `➕ ${t("msg_enter_name")}`;
                     const kb = { inline_keyboard: [[{ text: `❌ ${t("btn_cancel")}`, callback_data: "subs_list:0" }]] };
                     await sendOrEdit(chatId, text, kb, messageId);
                 } else if (data.startsWith("sub_edit_name_init:")) {
                     const uuid = data.replace("sub_edit_name_init:", "");
                     tgState[chatId] = { step: `sub_edit_name:${uuid}` };
-                    await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
                     const text = `✏️ ${t("msg_enter_name")}`;
                     const kb = { inline_keyboard: [[{ text: `❌ ${t("btn_cancel")}`, callback_data: `sub_detail:${uuid}` }]] };
                     await sendOrEdit(chatId, text, kb, messageId);
                 } else if (data.startsWith("sub_edit_limits_init:")) {
                     const uuid = data.replace("sub_edit_limits_init:", "");
                     tgState[chatId] = { step: `sub_edit_limits:${uuid}` };
-                    await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
                     const text = `⚙️ ${t("msg_enter_limits")}`;
                     const kb = {
                         inline_keyboard: [
@@ -1877,7 +2432,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                             u.limitTotalReq = null;
                             u.limitDailyReq = null;
                             u.expiryMs = null;
-                            await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+                            await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
                         }
                     }
                     const panelUsers = await getPanelUsers();
@@ -1914,12 +2469,12 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                             expiryMs: null,
                             createdAt: Date.now()
                         });
-                        await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+                        await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
                         const detail = getSubDetail(newUuid);
                         await sendOrEdit(chatId, `✅ ${t("msg_added")}\n\n${detail.text}`, detail.kb, messageId);
                     }
                     tgState[chatId] = null;
-                    await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
                 } else if (data === "sys_panic_init") {
                     const text = `${t("msg_confirm_panic")}`;
                     const kb = {
@@ -1934,7 +2489,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                 } else if (data === "sys_panic_confirm") {
                     sysConfig.apiRoute = Array.from(crypto.getRandomValues(new Uint8Array(8))).map(b => b.toString(16).padStart(2,'0')).join('');
                     sysConfig.isPaused = true;
-                    await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+                    await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
                     const successText = `${t("msg_panic")}\n\n🔑 New Secret Path Randomized. All old sessions revoked.`;
                     const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] };
                     await sendOrEdit(chatId, successText, kb, messageId);
@@ -2018,6 +2573,14 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     statsText += `👥 **${t("dash_total")}**: ${Array.isArray(users) ? users.length : 'N/A'}\n`;
                     statsText += `📊 **${t("total_traffic")}**: ${(totalReqs / 6000).toFixed(2)} GB\n`;
                     statsText += `📅 **${t("daily_traffic")}**: ${(dailyReqs / 6000).toFixed(2)} GB\n`;
+                    if (!isRemotePanel) {
+                        const upSeconds = Math.floor((Date.now() - isolateStartTime) / 1000);
+                        const dh = Math.floor(upSeconds / 3600);
+                        const dm = Math.floor((upSeconds % 3600) / 60);
+                        statsText += `⏱ **${t("tg_uptime")}**: ${dh}h ${dm}m\n`;
+                        statsText += `🔌 **${t("tg_conns")}**: ${activeConnections}\n`;
+                        statsText += `📦 **${t("tg_version")}**: v${CURRENT_VERSION}\n`;
+                    }
                     statsText += `━━━━━━━━━━━━━━━━`;
                     if (sysConfig.cfAccountId && sysConfig.cfApiToken) {
                         const reqs = await fetchCloudflareUsage(sysConfig.cfAccountId, sysConfig.cfApiToken);
@@ -2077,7 +2640,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     }
                 } else if (data === "sub_search_init") {
                     tgState[chatId] = { step: "sub_search" };
-                    await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
                     const text = `🔍 ${t("msg_enter_search")}`;
                     const kb = { inline_keyboard: [[{ text: `❌ ${t("btn_cancel")}`, callback_data: "main_menu" }]] };
                     await sendOrEdit(chatId, text, kb, messageId);
@@ -2095,7 +2658,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         } else {
                             sysUsageCache.users[uuidClean] = { reqs: 0, dReqs: 0, lastDay: new Date().toISOString().split('T')[0] };
                         }
-                        await d1Put(env, "sys_usage", JSON.stringify(sysUsageCache));
+                        await cachedD1Put(env, "sys_usage", JSON.stringify(sysUsageCache));
                     }
                     const panelUsers = await getPanelUsers();
                     const detail = getSubDetail(uuid, panelUsers);
@@ -2103,21 +2666,21 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                 } else if (data.startsWith("sub_extend_init:")) {
                     const uuid = data.replace("sub_extend_init:", "");
                     tgState[chatId] = { step: `sub_extend_days:${uuid}` };
-                    await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
                     const text = `📅 ${t("msg_enter_extend_days")}`;
                     const kb = { inline_keyboard: [[{ text: `❌ ${t("btn_cancel")}`, callback_data: `sub_detail:${uuid}` }]] };
                     await sendOrEdit(chatId, text, kb, messageId);
                 } else if (data.startsWith("sub_edit_notes_init:")) {
                     const uuid = data.replace("sub_edit_notes_init:", "");
                     tgState[chatId] = { step: `sub_edit_notes:${uuid}` };
-                    await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
                     const text = `📝 ${t("msg_enter_notes")}`;
                     const kb = { inline_keyboard: [[{ text: `❌ ${t("btn_cancel")}`, callback_data: `sub_detail:${uuid}` }]] };
                     await sendOrEdit(chatId, text, kb, messageId);
                 } else if (data.startsWith("sub_edit_device_init:")) {
                     const uuid = data.replace("sub_edit_device_init:", "");
                     tgState[chatId] = { step: `sub_edit_device:${uuid}` };
-                    await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
                     const text = `📱 ${t("msg_enter_device_limit")}`;
                     const kb = { inline_keyboard: [
                         [{ text: `♾️ Unlimited`, callback_data: `sub_device_unlimited:${uuid}` }],
@@ -2132,7 +2695,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         const u = sysConfig.users.find(usr => usr.id === uuid);
                         if (u) {
                             u.maxConfigs = null;
-                            await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+                            await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
                         }
                     }
                     const panelUsers = await getPanelUsers();
@@ -2146,19 +2709,213 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         body: JSON.stringify({ chat_id: chatId, text: `\`${subUrl}\``, parse_mode: 'Markdown' })
                     });
                     answerText = t("sub_link_sent");
+                } else if (data === "tg_settings_menu") {
+                    const modeTxt = sysConfig.mode === 'alpha' ? 'Alpha (V)' : sysConfig.mode === 'beta' ? 'Beta (T)' : 'Both';
+                    const portsTxt = sysConfig.socketPorts || '443';
+                    const passTxt = sysConfig.masterKey || 'admin';
+                    const dnsTxt = sysConfig.resolveIp || '1.1.1.1';
+                    const relayTxt = sysConfig.backupRelay || '—';
+                    const tfoTxt = sysConfig.enableOpt1 ? '✅' : '❌';
+                    const echTxt = sysConfig.enableOpt2 ? '✅' : '❌';
+                    const pauseTxt = sysConfig.isPaused ? '🔴 ON' : '🟢 OFF';
+                    const silentTxt = sysConfig.silentAlerts ? '✅' : '❌';
+                    const autoUpTxt = sysConfig.autoUpdate ? '✅' : '❌';
+                    const directTxt = sysConfig.enableDirectConfigs ? '✅' : '❌';
+                    const nat64Txt = sysConfig.nat64Prefix || '—';
+                    let text = `⚙️ **${t("tg_sys_settings")}**\n━━━━━━━━━━━━━━━━\n`;
+                    text += `📡 ${t("tg_proto")}: **${modeTxt}**\n`;
+                    text += `🔌 ${t("tg_ports")}: \`${portsTxt}\`\n`;
+                    text += `🔑 ${t("tg_pass")}: \`${passTxt}\`\n`;
+                    text += `🌐 ${t("tg_dns")}: \`${dnsTxt}\`\n`;
+                    text += `🔗 ${t("tg_relay")}: \`${relayTxt}\`\n`;
+                    text += `⚡ ${t("tg_tfo")}: ${tfoTxt} | ECH: ${echTxt}\n`;
+                    text += `🔇 ${t("tg_silent")}: ${silentTxt}\n`;
+                    text += `🛑 ${t("tg_pause")}: ${pauseTxt}\n`;
+                    text += `🔄 ${t("tg_auto_update")}: ${autoUpTxt}\n`;
+                    text += `🔀 ${t("tg_direct")}: ${directTxt}\n`;
+                    text += `🌐 ${t("tg_nat64")}: \`${nat64Txt}\`\n`;
+                    text += `━━━━━━━━━━━━━━━━`;
+                    const kb = { inline_keyboard: [
+                        [{ text: `📡 ${t("tg_proto")}`, callback_data: "tg_edit_proto" }, { text: `🔌 ${t("tg_ports")}`, callback_data: "tg_edit_ports" }],
+                        [{ text: `🔑 ${t("tg_pass")}`, callback_data: "tg_edit_pass" }, { text: `🌐 ${t("tg_dns")}`, callback_data: "tg_edit_dns" }],
+                        [{ text: `🔗 ${t("tg_relay")}`, callback_data: "tg_edit_relay" }],
+                        [{ text: `⚡ ${t("tg_tfo")}`, callback_data: "tg_toggle_tfo" }, { text: `ECH`, callback_data: "tg_toggle_ech" }],
+                        [{ text: `${t("tg_silent")}`, callback_data: "tg_toggle_silent" }, { text: `${t("tg_pause")}`, callback_data: "tg_toggle_pause2" }],
+                        [{ text: `🔄 ${t("tg_auto_update")}`, callback_data: "tg_toggle_auto_update" }, { text: `🔀 ${t("tg_direct")}`, callback_data: "tg_toggle_direct" }],
+                        [{ text: `🌐 ${t("tg_nat64")}`, callback_data: "tg_edit_nat64" }],
+                        [{ text: t("btn_main_menu"), callback_data: "main_menu" }]
+                    ] };
+                    await sendOrEdit(chatId, text, kb, messageId);
+                } else if (data === "tg_advanced_menu") {
+                    const cleanTxt = sysConfig.cleanIps ? sysConfig.cleanIps.substring(0, 40) + (sysConfig.cleanIps.length > 40 ? '...' : '') : '—';
+                    const nodesTxt = sysConfig.slaveNodes ? sysConfig.slaveNodes.substring(0, 40) + (sysConfig.slaveNodes.length > 40 ? '...' : '') : '—';
+                    const strategyTxt = sysConfig.nameStrategy || 'default';
+                    const prefixTxt = sysConfig.namePrefix || 'Core';
+                    const maintenanceTxt = sysConfig.maintenanceHost ? sysConfig.maintenanceHost.substring(0, 30) + '...' : '—';
+                    let text = `🔧 **${t("tg_adv_settings")}**\n━━━━━━━━━━━━━━━━\n`;
+                    text += `🧹 ${t("tg_clean_ips")}: \`${cleanTxt}\`\n`;
+                    text += `🖥️ ${t("tg_nodes")}: \`${nodesTxt}\`\n`;
+                    text += `📝 ${t("tg_strategy")}: \`${strategyTxt}\`\n`;
+                    text += `🏷️ ${t("tg_prefix")}: \`${prefixTxt}\`\n`;
+                    text += `🎭 ${t("tg_maintenance")}: \`${maintenanceTxt}\`\n`;
+                    text += `━━━━━━━━━━━━━━━━`;
+                    const kb = { inline_keyboard: [
+                        [{ text: `🧹 ${t("tg_clean_ips")}`, callback_data: "tg_edit_clean_ips" }],
+                        [{ text: `🖥️ ${t("tg_nodes")}`, callback_data: "tg_edit_nodes" }],
+                        [{ text: `📝 ${t("tg_strategy")}`, callback_data: "tg_edit_strategy" }, { text: `🏷️ ${t("tg_prefix")}`, callback_data: "tg_edit_prefix" }],
+                        [{ text: `🎭 ${t("tg_maintenance")}`, callback_data: "tg_edit_maintenance" }],
+                        [{ text: `🤖 ${t("tg_tg_settings")}`, callback_data: "tg_edit_tg_settings" }],
+                        [{ text: `☁️ ${t("tg_cf_settings")}`, callback_data: "tg_edit_cf_settings" }],
+                        [{ text: t("btn_main_menu"), callback_data: "main_menu" }]
+                    ] };
+                    await sendOrEdit(chatId, text, kb, messageId);
+                } else if (data === "tg_logs_menu") {
+                    let logs = [];
+                    if (env.IOT_DB) {
+                        const stored = await d1Get(env, "sys_logs");
+                        if (stored) logs = JSON.parse(stored);
+                    }
+                    let text = `📋 **${t("tg_logs")}**\n━━━━━━━━━━━━━━━━\n`;
+                    if (logs.length === 0) {
+                        text += `ℹ️ ${t("tg_log_empty")}\n`;
+                    } else {
+                        logs.slice(0, 10).forEach((log, i) => {
+                            const time = new Date(log.ts).toLocaleString();
+                            text += `${i + 1}. ${t("tg_log_entry")} **${log.type}**\n   ${log.detail}\n   📅 ${time}\n`;
+                        });
+                        if (logs.length > 10) text += `\n... ${logs.length - 10} more entries`;
+                    }
+                    text += `\n━━━━━━━━━━━━━━━━`;
+                    const kb = { inline_keyboard: [
+                        [{ text: `🔄 ${t("btn_update_usage")}`, callback_data: "tg_logs_menu" }],
+                        [{ text: t("btn_main_menu"), callback_data: "main_menu" }]
+                    ] };
+                    await sendOrEdit(chatId, text, kb, messageId);
+                } else if (data === "tg_toggle_tfo") {
+                    sysConfig.enableOpt1 = !sysConfig.enableOpt1;
+                    await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
+                    answerText = t("tg_saved");
+                    const menu = getMainMenu(getActivePanel(), isAuthorized);
+                    await sendOrEdit(chatId, menu.text, menu.kb, messageId);
+                } else if (data === "tg_toggle_ech") {
+                    sysConfig.enableOpt2 = !sysConfig.enableOpt2;
+                    await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
+                    answerText = t("tg_saved");
+                    const menu = getMainMenu(getActivePanel(), isAuthorized);
+                    await sendOrEdit(chatId, menu.text, menu.kb, messageId);
+                } else if (data === "tg_toggle_silent") {
+                    sysConfig.silentAlerts = !sysConfig.silentAlerts;
+                    await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
+                    answerText = t("tg_saved");
+                    const menu = getMainMenu(getActivePanel(), isAuthorized);
+                    await sendOrEdit(chatId, menu.text, menu.kb, messageId);
+                } else if (data === "tg_toggle_pause2") {
+                    sysConfig.isPaused = !sysConfig.isPaused;
+                    await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
+                    answerText = t("tg_saved");
+                    const menu = getMainMenu(getActivePanel(), isAuthorized);
+                    await sendOrEdit(chatId, menu.text, menu.kb, messageId);
+                } else if (data === "tg_toggle_auto_update") {
+                    sysConfig.autoUpdate = !sysConfig.autoUpdate;
+                    await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
+                    answerText = t("tg_saved");
+                    await sendOrEdit(chatId, `⚙️ ${t("tg_auto_update")}: ${sysConfig.autoUpdate ? '✅ ON' : '❌ OFF'}`, { inline_keyboard: [[{ text: "◀️ " + t("btn_back"), callback_data: "tg_settings_menu" }]] }, messageId);
+                } else if (data === "tg_toggle_direct") {
+                    sysConfig.enableDirectConfigs = !sysConfig.enableDirectConfigs;
+                    await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
+                    answerText = t("tg_saved");
+                    await sendOrEdit(chatId, `🔀 ${t("tg_direct")}: ${sysConfig.enableDirectConfigs ? '✅ ON' : '❌ OFF'}`, { inline_keyboard: [[{ text: "◀️ " + t("btn_back"), callback_data: "tg_settings_menu" }]] }, messageId);
+                } else if (data === "tg_edit_proto") {
+                    tgState[chatId] = { step: "tg_edit_proto" };
+                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                    const kb = { inline_keyboard: [
+                        [{ text: "Alpha (V-Core)", callback_data: "tg_set_proto:alpha" }, { text: "Beta (T-Core)", callback_data: "tg_set_proto:beta" }],
+                        [{ text: "Both", callback_data: "tg_set_proto:both" }],
+                        [{ text: "❌ " + t("btn_cancel"), callback_data: "tg_settings_menu" }]
+                    ] };
+                    await sendOrEdit(chatId, `📡 **${t("tg_proto")}**\n${t("tg_current_val")}: **${sysConfig.mode}**\n\n${t("tg_new_val")}`, kb, messageId);
+                } else if (data.startsWith("tg_set_proto:")) {
+                    const val = data.replace("tg_set_proto:", "");
+                    sysConfig.mode = val;
+                    await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
+                    tgState[chatId] = null;
+                    answerText = t("tg_saved");
+                    await sendOrEdit(chatId, `✅ ${t("tg_proto")}: **${val}**`, { inline_keyboard: [[{ text: "◀️ " + t("btn_back"), callback_data: "tg_settings_menu" }]] }, messageId);
+                } else if (data === "tg_edit_dns") {
+                    tgState[chatId] = { step: "tg_edit_dns" };
+                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                    await sendOrEdit(chatId, `🌐 **${t("tg_dns")}**\n${t("tg_current_val")}: \`${sysConfig.resolveIp}\`\n\n${t("tg_new_val")}`, { inline_keyboard: [[{ text: "❌ " + t("btn_cancel"), callback_data: "tg_settings_menu" }]] }, messageId);
+                } else if (data === "tg_edit_relay") {
+                    tgState[chatId] = { step: "tg_edit_relay" };
+                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                    await sendOrEdit(chatId, `🔗 **${t("tg_relay")}**\n${t("tg_current_val")}: \`${sysConfig.backupRelay || '—'}\`\n\n${t("tg_new_val")}\n_send empty to clear_`, { inline_keyboard: [[{ text: "❌ " + t("btn_cancel"), callback_data: "tg_settings_menu" }]] }, messageId);
+                } else if (data === "tg_edit_nat64") {
+                    tgState[chatId] = { step: "tg_edit_nat64" };
+                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                    await sendOrEdit(chatId, `🌐 **${t("tg_nat64")}**\n${t("tg_current_val")}: \`${sysConfig.nat64Prefix || '—'}\`\n\n${t("tg_new_val")}\n_send empty to clear_`, { inline_keyboard: [[{ text: "❌ " + t("btn_cancel"), callback_data: "tg_settings_menu" }]] }, messageId);
+                } else if (data === "tg_edit_maintenance") {
+                    tgState[chatId] = { step: "tg_edit_maintenance" };
+                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                    await sendOrEdit(chatId, `🎭 **${t("tg_maintenance")}**\n${t("tg_current_val")}: \`${sysConfig.maintenanceHost || '—'}\`\n\n${t("tg_new_val")}`, { inline_keyboard: [[{ text: "❌ " + t("btn_cancel"), callback_data: "tg_settings_menu" }]] }, messageId);
+                } else if (data === "tg_edit_clean_ips") {
+                    tgState[chatId] = { step: "tg_edit_clean_ips" };
+                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                    await sendOrEdit(chatId, `🧹 **${t("tg_clean_ips")}**\n${t("tg_current_val")}: \`${sysConfig.cleanIps || '—'}\`\n\n${t("tg_new_val")}\n_send empty to clear_`, { inline_keyboard: [[{ text: "❌ " + t("btn_cancel"), callback_data: "tg_advanced_menu" }]] }, messageId);
+                } else if (data === "tg_edit_nodes") {
+                    tgState[chatId] = { step: "tg_edit_nodes" };
+                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                    await sendOrEdit(chatId, `🖥️ **${t("tg_nodes")}**\n${t("tg_current_val")}: \`${sysConfig.slaveNodes || '—'}\`\n\n${t("tg_new_val")}\n_send empty to clear_`, { inline_keyboard: [[{ text: "❌ " + t("btn_cancel"), callback_data: "tg_advanced_menu" }]] }, messageId);
+                } else if (data === "tg_edit_strategy") {
+                    tgState[chatId] = { step: "tg_edit_strategy" };
+                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                    const kb = { inline_keyboard: [
+                        [{ text: "default", callback_data: "tg_set_strategy:default" }],
+                        [{ text: "type-user-port", callback_data: "tg_set_strategy:type-user-port" }],
+                        [{ text: "user-port", callback_data: "tg_set_strategy:user-port" }],
+                        [{ text: "ip", callback_data: "tg_set_strategy:ip" }],
+                        [{ text: "❌ " + t("btn_cancel"), callback_data: "tg_advanced_menu" }]
+                    ] };
+                    await sendOrEdit(chatId, `📝 **${t("tg_strategy")}**\n${t("tg_current_val")}: \`${sysConfig.nameStrategy}\`\n\n_send custom or select:_`, kb, messageId);
+                } else if (data.startsWith("tg_set_strategy:")) {
+                    const val = data.replace("tg_set_strategy:", "");
+                    sysConfig.nameStrategy = val;
+                    await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
+                    tgState[chatId] = null;
+                    answerText = t("tg_saved");
+                    await sendOrEdit(chatId, `✅ ${t("tg_strategy")}: **${val}**`, { inline_keyboard: [[{ text: "◀️ " + t("btn_back"), callback_data: "tg_advanced_menu" }]] }, messageId);
+                } else if (data === "tg_edit_prefix") {
+                    tgState[chatId] = { step: "tg_edit_prefix" };
+                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                    await sendOrEdit(chatId, `🏷️ **${t("tg_prefix")}**\n${t("tg_current_val")}: \`${sysConfig.namePrefix}\`\n\n${t("tg_new_val")}`, { inline_keyboard: [[{ text: "❌ " + t("btn_cancel"), callback_data: "tg_advanced_menu" }]] }, messageId);
+                } else if (data === "tg_edit_pass") {
+                    tgState[chatId] = { step: "tg_edit_pass" };
+                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                    await sendOrEdit(chatId, `🔑 **${t("tg_pass")}**\n${t("tg_current_val")}: \`${sysConfig.masterKey}\`\n\n${t("tg_new_val")}`, { inline_keyboard: [[{ text: "❌ " + t("btn_cancel"), callback_data: "tg_settings_menu" }]] }, messageId);
+                } else if (data === "tg_edit_ports") {
+                    tgState[chatId] = { step: "tg_edit_ports" };
+                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                    await sendOrEdit(chatId, `🔌 **${t("tg_ports")}**\n${t("tg_current_val")}: \`${sysConfig.socketPorts}\`\n\n${t("tg_new_val")}\n_comma separated e.g. 443,80_`, { inline_keyboard: [[{ text: "❌ " + t("btn_cancel"), callback_data: "tg_settings_menu" }]] }, messageId);
+                } else if (data === "tg_edit_tg_settings") {
+                    tgState[chatId] = { step: "tg_edit_tg_token" };
+                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                    await sendOrEdit(chatId, `🤖 **${t("tg_tg_settings")}**\n\n1️⃣ ${t("tg_current_val")}: \`${sysConfig.tgToken ? '***' + sysConfig.tgToken.slice(-4) : '—'}\`\n\n${t("tg_new_val")}\n_send /skip to keep current_`, { inline_keyboard: [[{ text: "❌ " + t("btn_cancel"), callback_data: "tg_advanced_menu" }]] }, messageId);
+                } else if (data === "tg_edit_cf_settings") {
+                    tgState[chatId] = { step: "tg_edit_cf_acc" };
+                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                    await sendOrEdit(chatId, `☁️ **${t("tg_cf_settings")}**\n\n1️⃣ CF Account ID: \`${sysConfig.cfAccountId || '—'}\`\n\n${t("tg_new_val")}\n_send /skip to keep current_`, { inline_keyboard: [[{ text: "❌ " + t("btn_cancel"), callback_data: "tg_advanced_menu" }]] }, messageId);
                 }
                 
-                await fetch(`${tgApi}/answerCallbackQuery`, {
+                ctx?.waitUntil(fetch(`${tgApi}/answerCallbackQuery`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ callback_query_id: cb.id, text: answerText || "Done!" })
-                });
+                }).catch(()=>{}));
             }
         } else if (update.message && update.message.text) {
             const chatId = update.message.chat.id;
             const text = update.message.text.trim();
             
-            if (chatId.toString() === sysConfig.tgChatId.toString() || isAuthorized || (callerId && !isAuthorized)) {
+            if (isAuthorized) {
                 // Get active panel from last login signal
                 const activePanel = getActivePanel();
                 const isRemotePanel = activePanel && !activePanel.isLocal;
@@ -2175,7 +2932,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                 // Handle /start command
                 if (text === "/start") {
                     tgState[chatId] = null;
-                    await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
                     const menu = getMainMenu(activePanel, isAuthorized);
                     await sendOrEdit(chatId, menu.text, menu.kb);
                     return new Response("OK", { status: 200 });
@@ -2186,7 +2943,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                 if (state) {
                     if (!isAuthorized) {
                         tgState[chatId] = null;
-                        await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
                         await sendOrEdit(chatId, t("access_denied"));
                         return new Response("OK", { status: 200 });
                     }
@@ -2194,7 +2951,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     if (state.step === "sub_add_name") {
                         const name = text;
                         tgState[chatId] = { step: "sub_add_limits", name: name };
-                        await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
                         
                         const msg = `⚙️ **${name}**\n\n${t("msg_enter_limits")}`;
                         const kb = {
@@ -2245,13 +3002,13 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                                 expiryMs: days ? Date.now() + days * 86400000 : null,
                                 createdAt: Date.now()
                             });
-                            await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+                            await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
                             const detail = getSubDetail(newUuid);
                             await sendOrEdit(chatId, `✅ ${t("msg_added")}\n\n${detail.text}`, detail.kb);
                         }
                         
                         tgState[chatId] = null;
-                        await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
                         return new Response("OK", { status: 200 });
                     }
                     
@@ -2263,11 +3020,11 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                             const u = sysConfig.users.find(usr => usr.id === uuid);
                             if (u) {
                                 u.name = text;
-                                await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+                                await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
                             }
                         }
                         tgState[chatId] = null;
-                        await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
                         
                         const panelUsers = await getPanelUsers();
                         const detail = getSubDetail(uuid, panelUsers);
@@ -2299,11 +3056,11 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                                 u.limitTotalReq = tReq;
                                 u.limitDailyReq = dReq;
                                 u.expiryMs = days ? Date.now() + days * 86400000 : null;
-                                await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+                                await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
                             }
                         }
                         tgState[chatId] = null;
-                        await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
                         
                         const panelUsers = await getPanelUsers();
                         const detail = getSubDetail(uuid, panelUsers);
@@ -2317,7 +3074,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         const users = panelUsers || [];
                         const results = users.filter(u => u.name.toLowerCase().includes(query) || u.id.toLowerCase().includes(query));
                         tgState[chatId] = null;
-                        await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
                         if (results.length === 0) {
                             const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] };
                             await sendOrEdit(chatId, `🔍 No users found for "${text}"`, kb);
@@ -2357,11 +3114,11 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                                     u.disabledReason = null;
                                     u.disabledAt = null;
                                 }
-                                await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+                                await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
                             }
                         }
                         tgState[chatId] = null;
-                        await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
                         const panelUsers = await getPanelUsers();
                         const detail = getSubDetail(uuid, panelUsers);
                         const msg = t("msg_expiry_extended").replace("{days}", days);
@@ -2377,11 +3134,11 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                             const u = sysConfig.users.find(usr => usr.id === uuid);
                             if (u) {
                                 u.notes = text;
-                                await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+                                await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
                             }
                         }
                         tgState[chatId] = null;
-                        await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
                         const panelUsers = await getPanelUsers();
                         const detail = getSubDetail(uuid, panelUsers);
                         await sendOrEdit(chatId, `✅ Notes updated!`, detail.kb);
@@ -2401,14 +3158,139 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                             const u = sysConfig.users.find(usr => usr.id === uuid);
                             if (u) {
                                 u.maxConfigs = limit > 0 ? limit : null;
-                                await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+                                await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
                             }
                         }
                         tgState[chatId] = null;
-                        await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
                         const panelUsers = await getPanelUsers();
                         const detail = getSubDetail(uuid, panelUsers);
-                        await sendOrEdit(chatId, `✅ Device limit updated!`, detail.kb);
+                        await sendOrEdit(chatId, `✅ ${t("config_limit_updated")}`, detail.kb);
+                        return new Response("OK", { status: 200 });
+                    }
+                    
+                    if (state.step === "tg_edit_dns") {
+                        sysConfig.resolveIp = text;
+                        await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
+                        tgState[chatId] = null;
+                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                        await sendOrEdit(chatId, `✅ ${t("tg_dns")}: \`${text}\``, { inline_keyboard: [[{ text: "◀️ " + t("btn_back"), callback_data: "tg_settings_menu" }]] });
+                        return new Response("OK", { status: 200 });
+                    }
+                    if (state.step === "tg_edit_relay") {
+                        sysConfig.backupRelay = text || '';
+                        await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
+                        tgState[chatId] = null;
+                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                        await sendOrEdit(chatId, `✅ ${t("tg_relay")}: \`${text || '—'}\``, { inline_keyboard: [[{ text: "◀️ " + t("btn_back"), callback_data: "tg_settings_menu" }]] });
+                        return new Response("OK", { status: 200 });
+                    }
+                    if (state.step === "tg_edit_nat64") {
+                        sysConfig.nat64Prefix = text || '';
+                        await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
+                        tgState[chatId] = null;
+                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                        await sendOrEdit(chatId, `✅ ${t("tg_nat64")}: \`${text || '—'}\``, { inline_keyboard: [[{ text: "◀️ " + t("btn_back"), callback_data: "tg_settings_menu" }]] });
+                        return new Response("OK", { status: 200 });
+                    }
+                    if (state.step === "tg_edit_maintenance") {
+                        sysConfig.maintenanceHost = text;
+                        await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
+                        tgState[chatId] = null;
+                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                        await sendOrEdit(chatId, `✅ ${t("tg_maintenance")}: \`${text}\``, { inline_keyboard: [[{ text: "◀️ " + t("btn_back"), callback_data: "tg_advanced_menu" }]] });
+                        return new Response("OK", { status: 200 });
+                    }
+                    if (state.step === "tg_edit_clean_ips") {
+                        sysConfig.cleanIps = text || '';
+                        await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
+                        tgState[chatId] = null;
+                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                        await sendOrEdit(chatId, `✅ ${t("tg_clean_ips")}: \`${text || '—'}\``, { inline_keyboard: [[{ text: "◀️ " + t("btn_back"), callback_data: "tg_advanced_menu" }]] });
+                        return new Response("OK", { status: 200 });
+                    }
+                    if (state.step === "tg_edit_nodes") {
+                        sysConfig.slaveNodes = text || '';
+                        await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
+                        tgState[chatId] = null;
+                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                        await sendOrEdit(chatId, `✅ ${t("tg_nodes")}: \`${text || '—'}\``, { inline_keyboard: [[{ text: "◀️ " + t("btn_back"), callback_data: "tg_advanced_menu" }]] });
+                        return new Response("OK", { status: 200 });
+                    }
+                    if (state.step === "tg_edit_prefix") {
+                        sysConfig.namePrefix = text;
+                        await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
+                        tgState[chatId] = null;
+                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                        await sendOrEdit(chatId, `✅ ${t("tg_prefix")}: \`${text}\``, { inline_keyboard: [[{ text: "◀️ " + t("btn_back"), callback_data: "tg_advanced_menu" }]] });
+                        return new Response("OK", { status: 200 });
+                    }
+                    if (state.step === "tg_edit_pass") {
+                        sysConfig.masterKey = text;
+                        await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
+                        tgState[chatId] = null;
+                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                        await sendOrEdit(chatId, `✅ ${t("tg_pass")}: \`${text}\``, { inline_keyboard: [[{ text: "◀️ " + t("btn_back"), callback_data: "tg_settings_menu" }]] });
+                        return new Response("OK", { status: 200 });
+                    }
+                    if (state.step === "tg_edit_strategy") {
+                        sysConfig.nameStrategy = text;
+                        await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
+                        tgState[chatId] = null;
+                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                        await sendOrEdit(chatId, `✅ ${t("tg_strategy")}: \`${text}\``, { inline_keyboard: [[{ text: "◀️ " + t("btn_back"), callback_data: "tg_advanced_menu" }]] });
+                        return new Response("OK", { status: 200 });
+                    }
+                    if (state.step === "tg_edit_tg_token") {
+                        if (text !== "/skip") sysConfig.tgToken = text;
+                        tgState[chatId] = { step: "tg_edit_tg_chat" };
+                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                        await sendOrEdit(chatId, `2️⃣ Chat ID: \`${sysConfig.tgChatId || '—'}\`\n\n${t("tg_new_val")}\n_send /skip to keep current_`, { inline_keyboard: [[{ text: "❌ " + t("btn_cancel"), callback_data: "tg_advanced_menu" }]] });
+                        return new Response("OK", { status: 200 });
+                    }
+                    if (state.step === "tg_edit_tg_chat") {
+                        if (text !== "/skip") sysConfig.tgChatId = text;
+                        tgState[chatId] = { step: "tg_edit_tg_admin" };
+                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                        await sendOrEdit(chatId, `3️⃣ Admin ID: \`${sysConfig.tgAdminId || '—'}\`\n\n${t("tg_new_val")}\n_send /skip to keep current_`, { inline_keyboard: [[{ text: "❌ " + t("btn_cancel"), callback_data: "tg_advanced_menu" }]] });
+                        return new Response("OK", { status: 200 });
+                    }
+                    if (state.step === "tg_edit_tg_admin") {
+                        if (text !== "/skip") sysConfig.tgAdminId = text;
+                        await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
+                        tgState[chatId] = null;
+                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                        await sendOrEdit(chatId, `✅ ${t("tg_tg_settings")} saved!`, { inline_keyboard: [[{ text: "◀️ " + t("btn_back"), callback_data: "tg_advanced_menu" }]] });
+                        return new Response("OK", { status: 200 });
+                    }
+                    if (state.step === "tg_edit_cf_acc") {
+                        if (text !== "/skip") sysConfig.cfAccountId = text;
+                        tgState[chatId] = { step: "tg_edit_cf_token" };
+                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                        await sendOrEdit(chatId, `2️⃣ CF API Token: \`${sysConfig.cfApiToken ? '***' + sysConfig.cfApiToken.slice(-4) : '—'}\`\n\n${t("tg_new_val")}\n_send /skip to keep current_`, { inline_keyboard: [[{ text: "❌ " + t("btn_cancel"), callback_data: "tg_advanced_menu" }]] });
+                        return new Response("OK", { status: 200 });
+                    }
+                    if (state.step === "tg_edit_cf_token") {
+                        if (text !== "/skip") sysConfig.cfApiToken = text;
+                        tgState[chatId] = { step: "tg_edit_cf_worker" };
+                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                        await sendOrEdit(chatId, `3️⃣ CF Worker Name: \`${sysConfig.cfWorkerName || '—'}\`\n\n${t("tg_new_val")}\n_send /skip to keep current_`, { inline_keyboard: [[{ text: "❌ " + t("btn_cancel"), callback_data: "tg_advanced_menu" }]] });
+                        return new Response("OK", { status: 200 });
+                    }
+                    if (state.step === "tg_edit_cf_worker") {
+                        if (text !== "/skip") sysConfig.cfWorkerName = text;
+                        await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
+                        tgState[chatId] = null;
+                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                        await sendOrEdit(chatId, `✅ ${t("tg_cf_settings")} saved!`, { inline_keyboard: [[{ text: "◀️ " + t("btn_back"), callback_data: "tg_advanced_menu" }]] });
+                        return new Response("OK", { status: 200 });
+                    }
+                    if (state.step === "tg_edit_ports") {
+                        sysConfig.socketPorts = text;
+                        await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
+                        tgState[chatId] = null;
+                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                        await sendOrEdit(chatId, `✅ ${t("tg_ports")}: \`${text}\``, { inline_keyboard: [[{ text: "◀️ " + t("btn_back"), callback_data: "tg_settings_menu" }]] });
                         return new Response("OK", { status: 200 });
                     }
                 }
@@ -2416,6 +3298,39 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                 // Default message / fallback menu
                 const menu = getMainMenu(activePanel, isAuthorized);
                 await sendOrEdit(chatId, menu.text, menu.kb);
+            } else {
+                if (text === "/start") {
+                    const userHint = langCode === 'fa'
+                        ? "لطفاً لینک اشتراک یا شناسه کاربری خود را ارسال کنید تا اطلاعات اشتراکتان نمایش داده شود."
+                        : "Please send your subscription link or User ID to view your subscription info.";
+                    await sendOrEdit(chatId, userHint);
+                    return new Response("OK", { status: 200 });
+                }
+                let lookupId = text.replace(/^https?:\/\//, '').replace(/\/.*$/, '').trim();
+                const subParamMatch = text.match(/[?&]sub=([^&]+)/);
+                if (subParamMatch) lookupId = decodeURIComponent(subParamMatch[1]);
+                if (!lookupId || lookupId.length < 3) {
+                    const userHint = langCode === 'fa'
+                        ? "لطفاً لینک اشتراک یا شناسه کاربری معتبر ارسال کنید."
+                        : "Please send a valid subscription link or User ID.";
+                    await sendOrEdit(chatId, userHint);
+                    return new Response("OK", { status: 200 });
+                }
+                const users = sysConfig.users || [];
+                const matchedUser = users.find(u =>
+                    u.id === lookupId ||
+                    u.id.replace(/-/g, '').toLowerCase() === lookupId.replace(/-/g, '').toLowerCase() ||
+                    u.name.toLowerCase() === lookupId.toLowerCase()
+                );
+                if (matchedUser) {
+                    const detail = getSubDetail(matchedUser.id);
+                    await sendOrEdit(chatId, detail.text, detail.kb);
+                } else {
+                    const notFound = langCode === 'fa'
+                        ? "کاربری با این شناسه یافت نشد."
+                        : "No user found with this ID.";
+                    await sendOrEdit(chatId, notFound);
+                }
             }
         }
         return new Response("OK", { status: 200 });
@@ -2454,23 +3369,43 @@ async function startDataPipe(webSocket, env, ctx) {
 
     async function parseSensorData(bufferData) {
         const view = new Uint8Array(bufferData);
-        let targetAddr = "", targetPort = 0, offset = 0, isModeAlpha = false;
+        let targetAddr = "", targetPort = 0, offset = 0, isModeAlpha = false, activeProfile = null;
 
         if (view[0] === 0x00) {
             isModeAlpha = true;
             
-            // Validate UUID
             let clientHash = Array.from(view.slice(1, 17)).map(b => b.toString(16).padStart(2, '0')).join('');
-            let validUUIDs = getAllProfiles().map(p => p.id.replace(/-/g, '').toLowerCase());
-            if (!validUUIDs.includes(clientHash)) return false; // DROP IF INVALID PROFILE
+            let configEntry = lookupConfigEntry(clientHash);
             
-            activeClientHash = clientHash;
+            if (configEntry) {
+                activeClientHash = configEntry.userId.replace(/-/g, '').toLowerCase();
+                activeProfile = getAllProfiles().find(p => p.id.replace(/-/g, '').toLowerCase() === activeClientHash);
+                if (!activeProfile) return false;
+                if (configEntry.relayIp) activeProfile = { ...activeProfile, proxyIp: configEntry.relayIp };
+            } else {
+                let decoded = decodeConfigUuid(clientHash);
+                if (decoded) {
+                    activeProfile = getAllProfiles().find(p => p.id.replace(/-/g, '').toLowerCase().startsWith(decoded.userFingerprint));
+                    if (activeProfile && decoded.relayIpIndex >= 0) {
+                        const effectivePips = getEffectivePips(activeProfile);
+                        if (effectivePips.length > 0) {
+                            const idx = decoded.relayIpIndex % effectivePips.length;
+                            activeProfile = { ...activeProfile, proxyIp: effectivePips[idx] };
+                        }
+                    }
+                }
+                if (!activeProfile) {
+                    activeProfile = getAllProfiles().find(p => p.id.replace(/-/g, '').toLowerCase() === clientHash);
+                }
+                if (!activeProfile) return false;
+                activeClientHash = activeProfile.id.replace(/-/g, '').toLowerCase();
+            }
             trackUsage(activeClientHash, 0, env, ctx);
             
-            let uTrack = uuidUsage.get(clientHash) || { connects: 0, last: 0 };
+            let uTrack = uuidUsage.get(activeClientHash) || { connects: 0, last: 0 };
             uTrack.connects++;
             uTrack.last = Date.now();
-            uuidUsage.set(clientHash, uTrack);
+            uuidUsage.set(activeClientHash, uTrack);
             
             const optLen = view[17];
             const pPos = 18 + optLen + 1;
@@ -2487,17 +3422,25 @@ async function startDataPipe(webSocket, env, ctx) {
             for (let i = 0; i < bufferData.byteLength; i++) { if (view[i] === 0x0D && view[i + 1] === 0x0A) { ePos = i; break; } }
             
             let clientHashHex = new TextDecoder().decode(view.slice(0, ePos));
-            let validProfile = getAllProfiles().find(p => getTrojanHash(p.id) === clientHashHex);
-            if (!validProfile) return false;
+            let configEntry = lookupConfigEntry(clientHashHex);
             
-            activeClientHash = validProfile.id.replace(/-/g, '').toLowerCase();
+            if (configEntry) {
+                activeClientHash = configEntry.userId.replace(/-/g, '').toLowerCase();
+                activeProfile = getAllProfiles().find(p => p.id.replace(/-/g, '').toLowerCase() === activeClientHash);
+                if (!activeProfile) return false;
+                if (configEntry.relayIp) activeProfile = { ...activeProfile, proxyIp: configEntry.relayIp };
+            } else {
+                activeProfile = getAllProfiles().find(p => getTrojanHash(p.id) === clientHashHex);
+                if (!activeProfile) return false;
+                activeClientHash = activeProfile.id.replace(/-/g, '').toLowerCase();
+            }
             trackUsage(activeClientHash, 0, env, ctx);
             let uTrack = uuidUsage.get(activeClientHash) || { connects: 0, last: 0 };
             uTrack.connects++;
             uTrack.last = Date.now();
             uuidUsage.set(activeClientHash, uTrack);
 
-            let hPos = ePos + 2; hPos++;
+            let hPos = ePos + 2; hPos++; hPos++;
             let aType = view[hPos]; hPos++; let aLen = 0;
 
             if (aType === 1) { aLen = 4; targetAddr = view.slice(hPos, hPos + aLen).join("."); }
@@ -2506,7 +3449,7 @@ async function startDataPipe(webSocket, env, ctx) {
 
             hPos += aLen;
             targetPort = new DataView(bufferData.slice(hPos, hPos + 2)).getUint16(0);
-            offset = hPos + 4;
+            offset = hPos + 2;
         }
 
         let isDomain = /^([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}$/.test(targetAddr) || /^[a-zA-Z0-9-]+$/.test(targetAddr);
@@ -2528,12 +3471,47 @@ async function startDataPipe(webSocket, env, ctx) {
             remoteSocket = connect({ hostname: connectAddr, port: targetPort });
             await remoteSocket.opened;
         } catch {
-            const fallbackIp = sysConfig.backupRelay || ["pro", "xy", "ip.cmliussss.net"].join("");
-            try {
-                const [altIP, altPortStr] = fallbackIp.split(":");
-                remoteSocket = connect({ hostname: altIP, port: altPortStr ? Number(altPortStr) : targetPort });
-                await remoteSocket.opened;
-            } catch { webSocket.close(); return isModeAlpha; }
+            let pips = [];
+            if (activeProfile && activeProfile.proxyIp) {
+                pips = activeProfile.proxyIp.split(/[\r\n,;]+/).map(s => s.trim()).filter(Boolean);
+            }
+            if (pips.length === 0 && sysConfig.backupRelay) {
+                pips = sysConfig.backupRelay.split(/[\r\n,;]+/).map(s => s.trim()).filter(Boolean);
+            }
+            if (pips.length === 0 && sysConfig.customRelay) {
+                pips = sysConfig.customRelay.split(/[\r\n,;]+/).map(s => s.trim()).filter(Boolean);
+            }
+
+            // Consistent hash based on user/profile ID to prevent session/IP splitting across assets on Cloudflare
+            let startIndex = 0;
+            if (pips.length > 1) {
+                let hash = 0;
+                let hashStr = (activeProfile ? activeProfile.id : "");
+                for (let i = 0; i < hashStr.length; i++) {
+                    hash = hashStr.charCodeAt(i) + ((hash << 5) - hash);
+                }
+                startIndex = Math.abs(hash) % pips.length;
+            }
+
+            // Attempt to connect with automatic failover to alternative proxy IPs
+            let connected = false;
+            for (let attempt = 0; attempt < Math.min(pips.length, 3); attempt++) {
+                let currentIndex = (startIndex + attempt) % pips.length;
+                let currentProxy = pips[currentIndex];
+                try {
+                    const [altIP, altPortStr] = currentProxy.split(":");
+                    remoteSocket = connect({ hostname: altIP, port: altPortStr ? Number(altPortStr) : targetPort });
+                    await remoteSocket.opened;
+                    connected = true;
+                    break;
+                } catch (e) {
+                    // Try next fallback proxy IP in list
+                }
+            }
+            if (!connected) {
+                webSocket.close();
+                return isModeAlpha;
+            }
         }
 
         dataWriter = remoteSocket.writable.getWriter();
@@ -2600,11 +3578,36 @@ function getSubscriptionStats(targetSub = null) {
     };
 }
 
+function getFakeConfigNames(targetSub = null) {
+    let stats = getSubscriptionStats(targetSub);
+    let configs = sysConfig.fakeConfigs || [
+        { name: "📊 {usage}", enabled: true },
+        { name: "📅 {expiry}", enabled: true }
+    ];
+    return configs.filter(f => f && f.enabled && f.name).map(f => {
+        return f.name.replace(/\{usage\}/g, stats.usedStr).replace(/\{expiry\}/g, stats.expiryStr);
+    });
+}
+
 function getCleanIps(hostName, userCleanIps = null) {
     let rawIps = userCleanIps || sysConfig.cleanIps;
-    let ips = rawIps ? rawIps.split(/[\r\n,;]+/).map(s => s.trim()).filter(Boolean) : [];
+    let ips = rawIps ? rawIps.split(/[\r\n,;]+/).map(s => { let t = s.trim(); return t ? t.split('#')[0].trim() : ''; }).filter(Boolean) : [];
     if (ips.length === 0) ips = [hostName.endsWith('.pages.dev') ? sysConfig.metricNode : hostName];
     return ips;
+}
+
+function getCleanIpsWithNames(hostName, userCleanIps = null) {
+    let rawIps = userCleanIps || sysConfig.cleanIps;
+    let entries = rawIps ? rawIps.split(/[\r\n,;]+/).map(s => {
+        let t = s.trim();
+        if (!t) return null;
+        let parts = t.split('#');
+        let ip = parts[0].trim();
+        let name = (parts[1] || '').trim();
+        return ip ? { ip, name } : null;
+    }).filter(Boolean) : [];
+    if (entries.length === 0) entries = [{ ip: hostName.endsWith('.pages.dev') ? sysConfig.metricNode : hostName, name: '' }];
+    return entries;
 }
 
 
@@ -2625,7 +3628,8 @@ function getAllProfiles(targetSub = null) {
                 if (usr.lastDay === new Date().toISOString().split('T')[0] && usr.dReqs >= u.limitDailyReq) skip = true;
             }
             if(!skip) {
-                list.push({ id: u.id, name: u.name, proxyIp: u.proxyIp, userMode: u.userMode || null, userPorts: u.userPorts || null, maxConfigs: u.maxConfigs || null });
+                list.push({ id: u.id, name: u.name, proxyIp: u.proxyIp, cleanIp: u.cleanIp || null, userMode: u.userMode || null, userPorts: u.userPorts || null, maxConfigs: u.maxConfigs || null, proxyIpGeo: u.proxyIpGeo || null, userNodes: u.userNodes || null, nat64: u.nat64 || null });
+                registerConfigEntry(u.id, u.id, u.proxyIp || '');
             }
         });
     }
@@ -2651,12 +3655,192 @@ function buildSingleUri(hostName) {
     return `${uriProto}://${activeDeviceId}@${finalIP}:${firstPort}?${ext}#${finalHost}`;
 }
 
-function getConfigName(type, profileName, port, hostName, ip) {
+
+function getProxyIpsArray(proxyIpString) {
+    if (!proxyIpString) return [];
+    return proxyIpString.split(/[\r\n,;]+/).map(s => {
+        let trimmed = s.trim();
+        if (!trimmed) return "";
+        let hostPort = trimmed.split('#')[0].split('@')[0];
+        if (hostPort.includes(':') && !hostPort.includes(']')) {
+            return hostPort.split(':')[0];
+        } else if (hostPort.startsWith('[') && hostPort.includes(']')) {
+            return hostPort.split(']')[0].replace('[', '');
+        }
+        return hostPort;
+    }).filter(Boolean);
+}
+
+function ipv4ToNat64(ipv4, prefix) {
+    if (!prefix || !ipv4) return null;
+    let parts = ipv4.split('.');
+    if (parts.length !== 4 || parts.some(p => isNaN(parseInt(p)))) return null;
+    let hex = parts.map(p => parseInt(p).toString(16).padStart(2, '0')).join('');
+    let suffix = hex.match(/.{1,4}/g).join(':');
+    return prefix.replace(/\/\d+$/, '').replace(/:$/, '') + '::' + suffix;
+}
+
+function getProxyIpsWithNat64(proxyIpString, nat64Prefix) {
+    let ips = getProxyIpsArray(proxyIpString);
+    if (nat64Prefix) {
+        let prefixes = nat64Prefix.split(/[\r\n,;]+/).map(s => s.trim()).filter(Boolean);
+        let nat64Ips = [];
+        prefixes.forEach(prefix => {
+            ips.forEach(ip => {
+                if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(ip)) {
+                    let nat64 = ipv4ToNat64(ip, prefix);
+                    if (nat64) nat64Ips.push(nat64);
+                }
+            });
+        });
+        ips = ips.concat(nat64Ips);
+    }
+    return ips;
+}
+
+const VALID_NAME_TAGS = ['FLAG', 'COUNTRY', 'CITY', 'ISP', 'PROTOCOL', 'USER', 'PORT', 'PREFIX', 'IP', 'IP_NAME', 'HOST', 'DATE', 'INDEX', 'WORKER'];
+const ipGeoCache = new Map();
+
+function validateNameStrategy(strategy) {
+    if (!strategy) return { valid: true, unknownTags: [] };
+    const tagPattern = /\{([A-Za-z]+)\}/g;
+    let match;
+    let unknownTags = [];
+    while ((match = tagPattern.exec(strategy)) !== null) {
+        let tag = match[1].toUpperCase();
+        if (!VALID_NAME_TAGS.includes(tag)) unknownTags.push(match[1]);
+    }
+    return { valid: unknownTags.length === 0, unknownTags };
+}
+
+async function preloadIpFlags(profiles, hostNames) {
+    let uniqueIps = new Set();
+    profiles.forEach(p => {
+        hostNames.forEach(h => {
+            getCleanIps(h, p.cleanIp).forEach(ip => uniqueIps.add(ip));
+        });
+        if (p.proxyIp) {
+            getProxyIpsArray(p.proxyIp).forEach(ip => uniqueIps.add(ip));
+        }
+    });
+    if (sysConfig.backupRelay) {
+        getProxyIpsArray(sysConfig.backupRelay).forEach(ip => uniqueIps.add(ip));
+    }
+    if (sysConfig.customRelay) {
+        getProxyIpsArray(sysConfig.customRelay).forEach(ip => uniqueIps.add(ip));
+    }
+
+    let uncached = Array.from(uniqueIps).filter(ip => !ipGeoCache.has(ip));
+    for (let i = 0; i < uncached.length; i += 100) {
+        let batch = uncached.slice(i, i + 100);
+        let queries = batch.map(ip => {
+            let clean = ip.split(':')[0].replace(/[\[\]]/g, '').split('#')[0].trim();
+            return { query: clean, fields: 'status,country,countryCode,city,isp,org' };
+        });
+        try {
+            const res = await fetch('http://ip-api.com/batch?fields=status,country,countryCode,city,isp,org', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(queries)
+            });
+            const results = await res.json();
+            batch.forEach((ip, idx) => {
+                let data = results[idx];
+                if (data && data.status === 'success') {
+                    const codePoints = data.countryCode.toUpperCase().split('').map(char => 127397 + char.charCodeAt());
+                    ipGeoCache.set(ip, {
+                        flag: String.fromCodePoint(...codePoints),
+                        country: data.country || 'Unknown',
+                        countryCode: data.countryCode || '',
+                        city: data.city || '',
+                        isp: data.isp || data.org || ''
+                    });
+                } else {
+                    ipGeoCache.set(ip, { flag: '🌐', country: 'Unknown', countryCode: '', city: '', isp: '' });
+                }
+            });
+        } catch(e) {
+            batch.forEach(ip => {
+                if (!ipGeoCache.has(ip)) {
+                    ipGeoCache.set(ip, { flag: '🌐', country: 'Unknown', countryCode: '', city: '', isp: '' });
+                }
+            });
+        }
+    }
+}
+
+function getEmojiFlag(ip) {
+    if (!ip) return "🌐";
+    let clean = ip.split(':')[0].replace(/[\[\]]/g, '').split('#')[0].trim();
+    let geo = ipGeoCache.get(ip) || ipGeoCache.get(clean);
+    return geo ? geo.flag : "🌐";
+}
+
+function getGeoInfo(ip) {
+    if (!ip) return { flag: '🌐', country: 'Unknown', countryCode: '', city: '', isp: '' };
+    let clean = ip.split(':')[0].replace(/[\[\]]/g, '').split('#')[0].trim();
+    return ipGeoCache.get(ip) || ipGeoCache.get(clean) || { flag: '🌐', country: 'Unknown', countryCode: '', city: '', isp: '' };
+}
+
+async function fetchIpGeoData(ip) {
+    if (!ip) return null;
+    let clean = ip.split(':')[0].replace(/[\[\]]/g, '').split('#')[0].trim();
+    try {
+        const res = await fetch(`http://ip-api.com/json/${clean}?fields=status,country,countryCode,city,isp,org`);
+        const data = await res.json();
+        if (data && data.status === 'success') {
+            const codePoints = data.countryCode.toUpperCase().split('').map(char => 127397 + char.charCodeAt());
+            return {
+                flag: String.fromCodePoint(...codePoints),
+                country: data.country || 'Unknown',
+                countryCode: data.countryCode || '',
+                city: data.city || '',
+                isp: data.isp || data.org || ''
+            };
+        }
+    } catch (e) {}
+    return null;
+}
+
+async function resolveUserProxyIpGeo(user) {
+    if (!user.proxyIp) { user.proxyIpGeo = null; return; }
+    let pips = getProxyIpsArray(user.proxyIp);
+    if (pips.length === 0) { user.proxyIpGeo = null; return; }
+    let geoData = await fetchIpGeoData(pips[0]);
+    user.proxyIpGeo = geoData || { flag: '🌐', country: 'Unknown', countryCode: '', city: '', isp: '' };
+}
+
+function getConfigName(type, profileName, port, hostName, ip, proxyIp = null, configIndex = 0, ipName = '') {
     let prefix = sysConfig.namePrefix || "Core";
     let strategy = sysConfig.nameStrategy || "default";
     let cleanName = profileName === "Default" ? "" : `-${profileName}`;
     let typeLab = type === "alpha" ? "V" : "T";
-    
+
+    if (strategy.includes('{') && strategy.includes('}')) {
+        let lookupIp = proxyIp || ip;
+        let geoInfo = getGeoInfo(lookupIp);
+        let protoLab = type === "alpha" ? "VLESS" : "Trojan";
+        let now = new Date();
+        let dateStr = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0') + '-' + String(now.getDate()).padStart(2, '0');
+        let workerName = sysConfig.cfWorkerName || sysConfig.name || hostName || '';
+        let resName = strategy
+            .replace(/{FLAG}/g, geoInfo.flag)
+            .replace(/{COUNTRY}/g, geoInfo.country)
+            .replace(/{CITY}/g, geoInfo.city)
+            .replace(/{ISP}/g, geoInfo.isp)
+            .replace(/{PROTOCOL}/g, protoLab)
+            .replace(/{USER}/g, profileName)
+            .replace(/{PORT}/g, port)
+            .replace(/{PREFIX}/g, prefix)
+            .replace(/{IP}/g, ip || '')
+            .replace(/{IP_NAME}/g, ipName || '')
+            .replace(/{HOST}/g, hostName || '')
+            .replace(/{DATE}/g, dateStr)
+            .replace(/{INDEX}/g, String(configIndex))
+            .replace(/{WORKER}/g, workerName);
+        return resName;
+    }
+
     if (strategy === "type-user-port") {
         return `${type === "alpha" ? "vl" + "ess" : "tro" + "jan"}-${profileName}-${port}`;
     } else if (strategy === "user-port") {
@@ -2665,7 +3849,12 @@ function getConfigName(type, profileName, port, hostName, ip) {
         return `${hostName}-${port}${cleanName}`;
     } else if (strategy === "prefix-user-port") {
         return `${prefix}${cleanName}-${port}`;
-    } else { // "default"
+    }
+    else if (strategy === "ip") {
+        return ip || 'unknown';
+    }
+
+    else { // "default"
         return `${typeLab}-Core-${port}${cleanName}`;
     }
 }
@@ -2679,44 +3868,104 @@ function calcEffectiveIps(ips, maxCfg, effectiveMode, effectivePorts) {
     return ips.slice(0, neededIps);
 }
 
-function buildUriProfile(hostName, targetSub = null, allowInsecure = false) {
-    let allHostNames = [hostName];
-    if (sysConfig.slaveNodes) allHostNames.push(...sysConfig.slaveNodes.split(/[\r\n,;]+/).map(s=>s.trim()).filter(Boolean));
-    
+function getProfileHostNames(hostName, profile) {
+    let names = [hostName];
+    if (profile && profile.userNodes) {
+        names.push(...profile.userNodes.split(/[\r\n,;]+/).map(s=>s.trim()).filter(Boolean));
+    } else if (sysConfig.slaveNodes) {
+        names.push(...sysConfig.slaveNodes.split(/[\r\n,;]+/).map(s=>s.trim()).filter(Boolean));
+    }
+    return names;
+}
+
+function getEffectiveNat64(userNat64) {
+    let parts = [];
+    if (userNat64) parts.push(...userNat64.split(/[\r\n,;]+/).map(s => s.trim()).filter(Boolean));
+    if (sysConfig.nat64Prefix) parts.push(...sysConfig.nat64Prefix.split(/[\r\n,;]+/).map(s => s.trim()).filter(Boolean));
+    return [...new Set(parts)].join(',') || null;
+}
+
+function getEffectivePips(p) {
+    let effectiveNat64 = getEffectiveNat64(p.nat64);
+    let pips = getProxyIpsWithNat64(p.proxyIp, effectiveNat64);
+    if (pips.length === 0 && sysConfig.backupRelay) {
+        pips = getProxyIpsWithNat64(sysConfig.backupRelay, effectiveNat64);
+    }
+    if (pips.length === 0 && sysConfig.customRelay) {
+        pips = getProxyIpsWithNat64(sysConfig.customRelay, effectiveNat64);
+    }
+    return pips;
+}
+
+async function buildUriProfile(hostName, targetSub = null, allowInsecure = false) {
     let ports = sysConfig.socketPorts ? sysConfig.socketPorts.split(',').map(s=>s.trim()).filter(Boolean) : ["443"];
     let reqPath = encodeURI(`/${sysConfig.apiRoute}`);
     
     let lines = [];
     let profiles = getAllProfiles(targetSub);
+    let allHostNames = [...new Set(profiles.flatMap(p => getProfileHostNames(hostName, p)))];
+    await preloadIpFlags(profiles, allHostNames);
     
     // Add fake configs
-    let stats = getSubscriptionStats(targetSub);
-    let fakeU1 = `trojan://00000000-0000-0000-0000-000000000000@127.0.0.1:1080?encryption=none&security=none#${encodeURIComponent("📊 " + stats.usedStr)}`;
-    let fakeU2 = `trojan://00000000-0000-0000-0000-000000000000@127.0.0.1:1080?encryption=none&security=none#${encodeURIComponent("📅 " + stats.expiryStr)}`;
-    lines.push(fakeU1, fakeU2);
+    let fakeNames = getFakeConfigNames(targetSub);
+    fakeNames.forEach(name => {
+        lines.push(`trojan://00000000-0000-0000-0000-000000000000@127.0.0.1:1080?encryption=none&security=none#${encodeURIComponent(name)}`);
+    });
     
     profiles.forEach(p => {
+        let pips = getEffectivePips(p);
         let effectiveMode = p.userMode || sysConfig.mode;
         let effectivePorts = p.userPorts ? p.userPorts.split(',').map(s=>s.trim()).filter(Boolean) : ports;
         let maxCfg = p.maxConfigs || null;
 
-        allHostNames.forEach(hName => {
-            let allIps = getCleanIps(hName, p.proxyIp);
+        let configIndex = 0;
+        let profileHostNames = getProfileHostNames(hostName, p);
+
+        profileHostNames.forEach(hName => {
+            let ipEntries = getCleanIpsWithNames(hName, p.cleanIp);
+            let allIps = ipEntries.map(e => e.ip);
             let ips = calcEffectiveIps(allIps, maxCfg, effectiveMode, effectivePorts);
+            let ipNameMap = {};
+            ipEntries.forEach(e => { ipNameMap[e.ip] = e.name; });
             effectivePorts.forEach(port => {
                 let sec = getTransportParams(port);
                 let extBase = `encryption=none&security=${sec}&sni=${hName}&fp=${sysConfig.agent}&type=ws&host=${hName}&path=${reqPath}`;
                 if (sysConfig.enableOpt2) extBase += `&pbk=enabled`;
                 extBase += `&allowInsecure=${allowInsecure ? "1" : "0"}`;
                 ips.forEach(ip => {
-                    let vName = getConfigName("alpha", p.name, port, hName, ip);
-                    let tName = getConfigName("beta", p.name, port, hName, ip);
+                    let selectedProxyIp = null;
+                    if (pips.length > 0) {
+                        selectedProxyIp = pips[configIndex % pips.length];
+                    }
+                    let ipName = ipNameMap[ip] || '';
+                    let vName = getConfigName("alpha", p.name, port, hName, ip, selectedProxyIp, configIndex, ipName);
+                    let tName = getConfigName("beta", p.name, port, hName, ip, selectedProxyIp, configIndex, ipName);
                     if (effectiveMode === "alpha" || effectiveMode === "both") {
-                        lines.push(`${getAlpha()}://${p.id}@${ip}:${port}?${extBase}#${vName}`);
+                        let configUuid = generateConfigUuid(p.id, configIndex);
+                        registerConfigEntry(configUuid, p.id, selectedProxyIp || '');
+                        lines.push(`${getAlpha()}://${configUuid}@${ip}:${port}?${extBase}#${vName}`);
                     }
                     if (effectiveMode === "beta" || effectiveMode === "both") {
-                        lines.push(`${getBeta()}://${p.id}@${ip}:${port}?${extBase}#${tName}`);
+                        let configUuid = generateConfigUuid(p.id, configIndex);
+                        registerConfigEntry(configUuid, p.id, selectedProxyIp || '');
+                        lines.push(`${getBeta()}://${configUuid}@${ip}:${port}?${extBase}#${tName}`);
                     }
+                    if (sysConfig.enableDirectConfigs && pips.length > 0) {
+                        configIndex++;
+                        let dvName = getConfigName("alpha", p.name, port, hName, ip, null, configIndex, ipName);
+                        let dtName = getConfigName("beta", p.name, port, hName, ip, null, configIndex, ipName);
+                        if (effectiveMode === "alpha" || effectiveMode === "both") {
+                            let configUuid = generateConfigUuid(p.id, configIndex);
+                            registerConfigEntry(configUuid, p.id, '');
+                            lines.push(`${getAlpha()}://${configUuid}@${ip}:${port}?${extBase}#${dvName}`);
+                        }
+                        if (effectiveMode === "beta" || effectiveMode === "both") {
+                            let configUuid = generateConfigUuid(p.id, configIndex);
+                            registerConfigEntry(configUuid, p.id, '');
+                            lines.push(`${getBeta()}://${configUuid}@${ip}:${port}?${extBase}#${dtName}`);
+                        }
+                    }
+                    configIndex++;
                 });
             });
         });
@@ -2724,22 +3973,22 @@ function buildUriProfile(hostName, targetSub = null, allowInsecure = false) {
     return lines.join('\n');
 }
 
-function buildYamlProfile(hostName, targetSub = null, allowInsecure = false) {
-    let allHostNames = [hostName];
-    if (sysConfig.slaveNodes) allHostNames.push(...sysConfig.slaveNodes.split(/[\r\n,;]+/).map(s=>s.trim()).filter(Boolean));
-    
+async function buildYamlProfile(hostName, targetSub = null, allowInsecure = false) {
     let ports = sysConfig.socketPorts ? sysConfig.socketPorts.split(',').map(s=>s.trim()).filter(Boolean) : ["443"];
     let proxies = [];
     let proxyNames = [];
     let nameCounts = {}; // Track proxy names for deduplication
     let profiles = getAllProfiles(targetSub);
+    let allHostNames = [...new Set(profiles.flatMap(p => getProfileHostNames(hostName, p)))];
+    await preloadIpFlags(profiles, allHostNames);
 
     // Add fake configs
-    let stats = getSubscriptionStats(targetSub);
-    let fake1 = `📊 ${stats.usedStr}`;
-    let fake2 = `📅 ${stats.expiryStr}`;
-    proxies.push(`- name: "${fake1}"\n  type: ${getBeta()}\n  server: 127.0.0.1\n  port: 80\n  password: "${activeDeviceId}"\n  udp: true\n  tls: false`);
-    proxies.push(`- name: "${fake2}"\n  type: ${getBeta()}\n  server: 127.0.0.1\n  port: 80\n  password: "${activeDeviceId}"\n  udp: true\n  tls: false`);
+    let fakeNames = getFakeConfigNames(targetSub);
+    let fakeRefs = [];
+    fakeNames.forEach(name => {
+        proxies.push(`- name: "${name}"\n  type: ${getBeta()}\n  server: 127.0.0.1\n  port: 80\n  password: "${activeDeviceId}"\n  udp: true\n  tls: false`);
+        fakeRefs.push(`"${name}"`);
+    });
 
     const getUniqueName = (baseName) => {
         if (!nameCounts[baseName]) {
@@ -2758,33 +4007,74 @@ function buildYamlProfile(hostName, targetSub = null, allowInsecure = false) {
     };
 
     profiles.forEach(p => {
+        let pips = getEffectivePips(p);
         let effectiveMode = p.userMode || sysConfig.mode;
         let effectivePorts = p.userPorts ? p.userPorts.split(',').map(s=>s.trim()).filter(Boolean) : ports;
         let maxCfg = p.maxConfigs || null;
 
-        allHostNames.forEach(hName => {
-            let allIps = getCleanIps(hName, p.proxyIp);
+        let configIndex = 0;
+        let profileHostNames = getProfileHostNames(hostName, p);
+
+        profileHostNames.forEach(hName => {
+            let ipEntries = getCleanIpsWithNames(hName, p.cleanIp);
+            let allIps = ipEntries.map(e => e.ip);
             let ips = calcEffectiveIps(allIps, maxCfg, effectiveMode, effectivePorts);
+            let ipNameMap = {};
+            ipEntries.forEach(e => { ipNameMap[e.ip] = e.name; });
             effectivePorts.forEach(port => {
                 let sec = getTransportParams(port) === "tls" ? "true" : "false";
                 ips.forEach(ip => {
+                    let selectedProxyIp = null;
+                    if (pips.length > 0) {
+                        selectedProxyIp = pips[configIndex % pips.length];
+                    }
+                    let ipName = ipNameMap[ip] || '';
                     if (effectiveMode === "alpha" || effectiveMode === "both") {
-                        let vName = getConfigName("alpha", p.name, port, hName, ip);
+                        let vName = getConfigName("alpha", p.name, port, hName, ip, selectedProxyIp, configIndex, ipName);
                         vName = getUniqueName(vName);
                         proxyNames.push(`"${vName}"`);
                         let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
                         let payloadVl = { junk: randomJunk, protocol: "vl", mode: "proxyip", panelIPs: [] };
                         let pathStrVl = "/" + btoa(JSON.stringify(payloadVl));
-                        proxies.push(`- name: "${vName}"\n  type: ${getAlpha()}\n  server: ${ip}\n  port: ${port}\n  uuid: ${p.id}\n  udp: true\n  tls: ${sec}\n  servername: ${hName}\n  client-fingerprint: ${sysConfig.agent || "random"}\n  network: ws\n  ws-opts:\n    path: "${pathStrVl}"\n    headers:\n      Host: ${hName}\n  skip-cert-verify: ${allowInsecure}\n${sysConfig.enableOpt1 ? "  tfo: true" : ""}`);
+                        let configUuid = generateConfigUuid(p.id, configIndex);
+                        registerConfigEntry(configUuid, p.id, selectedProxyIp || '');
+                        proxies.push(`- name: "${vName}"\n  type: ${getAlpha()}\n  server: ${ip}\n  port: ${port}\n  uuid: ${configUuid}\n  udp: true\n  tls: ${sec}\n  servername: ${hName}\n  client-fingerprint: ${sysConfig.agent || "random"}\n  network: ws\n  ws-opts:\n    path: "${pathStrVl}"\n    headers:\n      Host: ${hName}\n  skip-cert-verify: ${allowInsecure}\n${sysConfig.enableOpt1 ? "  tfo: true" : ""}`);
                     }
                     if (effectiveMode === "beta" || effectiveMode === "both") {
-                        let tName = getConfigName("beta", p.name, port, hName, ip);
+                        let tName = getConfigName("beta", p.name, port, hName, ip, selectedProxyIp, configIndex, ipName);
                         tName = getUniqueName(tName);
                         proxyNames.push(`"${tName}"`);
                         let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
                         let payloadTr = { junk: randomJunk, protocol: "tr", mode: "proxyip", panelIPs: [] };
                         let pathStrTr = "/" + btoa(JSON.stringify(payloadTr));
-                        proxies.push(`- name: "${tName}"\n  type: ${getBeta()}\n  server: ${ip}\n  port: ${port}\n  password: ${p.id}\n  udp: true\n  tls: ${sec}\n  sni: ${hName}\n  client-fingerprint: ${sysConfig.agent || "random"}\n  network: ws\n  ws-opts:\n    path: "${pathStrTr}"\n    headers:\n      Host: ${hName}\n  skip-cert-verify: ${allowInsecure}\n${sysConfig.enableOpt1 ? "  tfo: true" : ""}`);
+                        let configUuid2 = generateConfigUuid(p.id, configIndex);
+                        registerConfigEntry(configUuid2, p.id, selectedProxyIp || '');
+                        proxies.push(`- name: "${tName}"\n  type: ${getBeta()}\n  server: ${ip}\n  port: ${port}\n  password: ${configUuid2}\n  udp: true\n  tls: ${sec}\n  sni: ${hName}\n  client-fingerprint: ${sysConfig.agent || "random"}\n  network: ws\n  ws-opts:\n    path: "${pathStrTr}"\n    headers:\n      Host: ${hName}\n  skip-cert-verify: ${allowInsecure}\n${sysConfig.enableOpt1 ? "  tfo: true" : ""}`);
+                    }
+                    configIndex++;
+                    if (sysConfig.enableDirectConfigs && pips.length > 0) {
+                        let dcIndex = configIndex;
+                        if (effectiveMode === "alpha" || effectiveMode === "both") {
+                            let dvName = getUniqueName(getConfigName("alpha", p.name, port, hName, ip, null, dcIndex, ipName));
+                            proxyNames.push(`"${dvName}"`);
+                            let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
+                            let payloadVl = { junk: randomJunk, protocol: "vl", mode: "proxyip", panelIPs: [] };
+                            let pathStrVl = "/" + btoa(JSON.stringify(payloadVl));
+                            let configUuid = generateConfigUuid(p.id, dcIndex);
+                            registerConfigEntry(configUuid, p.id, '');
+                            proxies.push(`- name: "${dvName}"\n  type: ${getAlpha()}\n  server: ${ip}\n  port: ${port}\n  uuid: ${configUuid}\n  udp: true\n  tls: ${sec}\n  servername: ${hName}\n  client-fingerprint: ${sysConfig.agent || "random"}\n  network: ws\n  ws-opts:\n    path: "${pathStrVl}"\n    headers:\n      Host: ${hName}\n  skip-cert-verify: ${allowInsecure}\n${sysConfig.enableOpt1 ? "  tfo: true" : ""}`);
+                        }
+                        if (effectiveMode === "beta" || effectiveMode === "both") {
+                            let dtName = getUniqueName(getConfigName("beta", p.name, port, hName, ip, null, dcIndex, ipName));
+                            proxyNames.push(`"${dtName}"`);
+                            let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
+                            let payloadTr = { junk: randomJunk, protocol: "tr", mode: "proxyip", panelIPs: [] };
+                            let pathStrTr = "/" + btoa(JSON.stringify(payloadTr));
+                            let configUuid2 = generateConfigUuid(p.id, dcIndex);
+                            registerConfigEntry(configUuid2, p.id, '');
+                            proxies.push(`- name: "${dtName}"\n  type: ${getBeta()}\n  server: ${ip}\n  port: ${port}\n  password: ${configUuid2}\n  udp: true\n  tls: ${sec}\n  sni: ${hName}\n  client-fingerprint: ${sysConfig.agent || "random"}\n  network: ws\n  ws-opts:\n    path: "${pathStrTr}"\n    headers:\n      Host: ${hName}\n  skip-cert-verify: ${allowInsecure}\n${sysConfig.enableOpt1 ? "  tfo: true" : ""}`);
+                        }
+                        configIndex++;
                     }
                 });
             });
@@ -2865,8 +4155,7 @@ proxy-groups:
     type: select
     proxies:
       - "💦 Best Ping 🚀"
-      - "${fake1}"
-      - "${fake2}"
+${fakeRefs.map(n => `      - ${n}`).join('\n')}
 ${allProxies}
   - name: "💦 Best Ping 🚀"
     type: url-test
@@ -2898,11 +4187,11 @@ function getIpTypeLabel(ip) {
     return "Domain";
 }
 
-function buildClashJsonProfile(hostName, targetSub = null, allowInsecure = false) {
-    let allHostNames = [hostName];
-    if (sysConfig.slaveNodes) allHostNames.push(...sysConfig.slaveNodes.split(/[\r\n,;]+/).map(s=>s.trim()).filter(Boolean));
+async function buildClashJsonProfile(hostName, targetSub = null, allowInsecure = false) {
     let ports = sysConfig.socketPorts ? sysConfig.socketPorts.split(',').map(s=>s.trim()).filter(Boolean) : ["443"];
     let profiles = getAllProfiles(targetSub);
+    let allHostNames = [...new Set(profiles.flatMap(p => getProfileHostNames(hostName, p)))];
+    await preloadIpFlags(profiles, allHostNames);
     let reqPath = encodeURI(`/${sysConfig.apiRoute}`);
 
     let proxiesArr = [];
@@ -2910,26 +4199,19 @@ function buildClashJsonProfile(hostName, targetSub = null, allowInsecure = false
     let nameCounts = {};
 
     // Add fake configs
-    let stats = getSubscriptionStats(targetSub);
-    let fake1 = `📊 ${stats.usedStr}`;
-    let fake2 = `📅 ${stats.expiryStr}`;
-    proxiesArr.push({
-        "name": fake1,
-        "type": k_tr_mode,
-        "server": "127.0.0.1",
-        "port": 80,
-        "password": activeDeviceId,
-        "tls": false,
-        "udp": true
-    });
-    proxiesArr.push({
-        "name": fake2,
-        "type": k_tr_mode,
-        "server": "127.0.0.1",
-        "port": 80,
-        "password": activeDeviceId,
-        "tls": false,
-        "udp": true
+    let fakeNames = getFakeConfigNames(targetSub);
+    let fakeRefs = [];
+    fakeNames.forEach(name => {
+        proxiesArr.push({
+            "name": name,
+            "type": k_tr_mode,
+            "server": "127.0.0.1",
+            "port": 80,
+            "password": activeDeviceId,
+            "tls": false,
+            "udp": true
+        });
+        fakeRefs.push(name);
     });
 
     const getUniqueName = (baseName) => {
@@ -2949,27 +4231,42 @@ function buildClashJsonProfile(hostName, targetSub = null, allowInsecure = false
     };
 
     profiles.forEach(p => {
+        let pips = getEffectivePips(p);
         let effectiveMode = p.userMode || sysConfig.mode;
         let effectivePorts = p.userPorts ? p.userPorts.split(',').map(s=>s.trim()).filter(Boolean) : ports;
         let maxCfg = p.maxConfigs || null;
 
-        allHostNames.forEach(hName => {
-            let allIps = getCleanIps(hName, p.proxyIp);
+        let configIndex = 0;
+        let profileHostNames = getProfileHostNames(hostName, p);
+
+        profileHostNames.forEach(hName => {
+            let ipEntries = getCleanIpsWithNames(hName, p.cleanIp);
+            let allIps = ipEntries.map(e => e.ip);
             let ips = calcEffectiveIps(allIps, maxCfg, effectiveMode, effectivePorts);
+            let ipNameMap = {};
+            ipEntries.forEach(e => { ipNameMap[e.ip] = e.name; });
             effectivePorts.forEach(port => {
                 let sec = getTransportParams(port) === "tls";
                 ips.forEach(ip => {
                     let isVless = effectiveMode === "alpha" || effectiveMode === "both";
                     let isTrojan = effectiveMode === "beta" || effectiveMode === "both";
+                    let selectedProxyIp = null;
+                    if (pips.length > 0) {
+                        selectedProxyIp = pips[configIndex % pips.length];
+                    }
+                    let ipName = ipNameMap[ip] || '';
 
                     if (isVless) {
-                        let tagStr = getConfigName("alpha", p.name, port, hName, ip);
+                        let tagStr = getConfigName("alpha", p.name, port, hName, ip, selectedProxyIp, configIndex, ipName);
                         tagStr = getUniqueName(tagStr);
                         dynamicTags.push(tagStr);
                         
                         let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
                         let payloadVl = { junk: randomJunk, protocol: "vl", mode: "proxyip", panelIPs: [] };
                         let pathStrVl = "/" + btoa(JSON.stringify(payloadVl));
+
+                        let configUuid = generateConfigUuid(p.id, configIndex);
+                        registerConfigEntry(configUuid, p.id, selectedProxyIp || '');
 
                         let ob = {
                             "name": tagStr,
@@ -2979,7 +4276,7 @@ function buildClashJsonProfile(hostName, targetSub = null, allowInsecure = false
                             "ip-version": "ipv4-prefer",
                             "tfo": sysConfig.enableOpt1 || false,
                             "udp": true,
-                            "uuid": p.id,
+                            "uuid": configUuid,
                             "packet-encoding": "xudp",
                             "tls": sec,
                             "servername": hName,
@@ -3006,13 +4303,16 @@ function buildClashJsonProfile(hostName, targetSub = null, allowInsecure = false
                     }
 
                     if (isTrojan) {
-                        let tagStr = getConfigName("beta", p.name, port, hName, ip);
+                        let tagStr = getConfigName("beta", p.name, port, hName, ip, selectedProxyIp, configIndex, ipName);
                         tagStr = getUniqueName(tagStr);
                         dynamicTags.push(tagStr);
 
                         let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
                         let payloadTr = { junk: randomJunk, protocol: "tr", mode: "proxyip", panelIPs: [] };
                         let pathStrTr = "/" + btoa(JSON.stringify(payloadTr));
+
+                        let configUuid2 = generateConfigUuid(p.id, configIndex);
+                        registerConfigEntry(configUuid2, p.id, selectedProxyIp || '');
 
                         let ob = {
                             "name": tagStr,
@@ -3022,7 +4322,7 @@ function buildClashJsonProfile(hostName, targetSub = null, allowInsecure = false
                             "ip-version": "ipv4-prefer",
                             "tfo": sysConfig.enableOpt1 || false,
                             "udp": true,
-                            "password": p.id,
+                            "password": configUuid2,
                             "packet-encoding": "xudp",
                             "tls": sec,
                             "sni": hName,
@@ -3046,6 +4346,34 @@ function buildClashJsonProfile(hostName, targetSub = null, allowInsecure = false
                             };
                         }
                         proxiesArr.push(ob);
+                    }
+                    configIndex++;
+                    if (sysConfig.enableDirectConfigs && pips.length > 0) {
+                        if (isVless) {
+                            let tagStr = getUniqueName(getConfigName("alpha", p.name, port, hName, ip, null, configIndex, ipName));
+                            dynamicTags.push(tagStr);
+                            let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
+                            let payloadVl = { junk: randomJunk, protocol: "vl", mode: "proxyip", panelIPs: [] };
+                            let pathStrVl = "/" + btoa(JSON.stringify(payloadVl));
+                            let configUuid = generateConfigUuid(p.id, configIndex);
+                            registerConfigEntry(configUuid, p.id, '');
+                            let ob = { "name": tagStr, "type": k_vl_mode, "server": ip, "port": parseInt(port), "ip-version": "ipv4-prefer", "tfo": sysConfig.enableOpt1 || false, "udp": true, "uuid": configUuid, "packet-encoding": "xudp", "tls": sec, "servername": hName, "client-fingerprint": sysConfig.agent || "random", "skip-cert-verify": allowInsecure, "alpn": ["http/1.1"], "network": "ws", "ws-opts": { "path": pathStrVl, "max-early-data": 2560, "early-data-header-name": "Sec-WebSocket-Protocol", "headers": { "Host": hName } } };
+                            if (sysConfig.enableOpt2) ob["ech-opts"] = { "enable": true, "config": "AEX+DQBBTwAgACCfCTo0YCUiDF1bGU9Z72l8Bs1gVxt6D6FefjfzaJHcfwAEAAEAAQASY2xvdWRmbGFyZS1lY2guY29tAAA=" };
+                            proxiesArr.push(ob);
+                        }
+                        if (isTrojan) {
+                            let tagStr = getUniqueName(getConfigName("beta", p.name, port, hName, ip, null, configIndex, ipName));
+                            dynamicTags.push(tagStr);
+                            let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
+                            let payloadTr = { junk: randomJunk, protocol: "tr", mode: "proxyip", panelIPs: [] };
+                            let pathStrTr = "/" + btoa(JSON.stringify(payloadTr));
+                            let configUuid2 = generateConfigUuid(p.id, configIndex);
+                            registerConfigEntry(configUuid2, p.id, '');
+                            let ob = { "name": tagStr, "type": k_tr_mode, "server": ip, "port": parseInt(port), "ip-version": "ipv4-prefer", "tfo": sysConfig.enableOpt1 || false, "udp": true, "password": configUuid2, "packet-encoding": "xudp", "tls": sec, "sni": hName, "client-fingerprint": sysConfig.agent || "random", "skip-cert-verify": allowInsecure, "alpn": ["http/1.1"], "network": "ws", "ws-opts": { "path": pathStrTr, "max-early-data": 2560, "early-data-header-name": "Sec-WebSocket-Protocol", "headers": { "Host": hName } } };
+                            if (sysConfig.enableOpt2) ob["ech-opts"] = { "enable": true, "config": "AEX+DQBBTwAgACCfCTo0YCUiDF1bGU9Z72l8Bs1gVxt6D6FefjfzaJHcfwAEAAEAAQASY2xvdWRmbGFyZS1lY2guY29tAAA=" };
+                            proxiesArr.push(ob);
+                        }
+                        configIndex++;
                     }
                 });
             });
@@ -3132,7 +4460,7 @@ function buildClashJsonProfile(hostName, targetSub = null, allowInsecure = false
             {
                 "name": "✅ Selector",
                 "type": "select",
-                "proxies": ["💦 Best Ping 🚀", fake1, fake2, ...dynamicTags]
+                "proxies": ["💦 Best Ping 🚀", ...fakeRefs, ...dynamicTags]
             },
             {
                 "name": "💦 Best Ping 🚀",
@@ -3186,11 +4514,11 @@ function buildClashJsonProfile(hostName, targetSub = null, allowInsecure = false
     };
 }
 
-function buildSingBoxJsonProfile(hostName, targetSub = null, allowInsecure = false) {
-    let allHostNames = [hostName];
-    if (sysConfig.slaveNodes) allHostNames.push(...sysConfig.slaveNodes.split(/[\r\n,;]+/).map(s=>s.trim()).filter(Boolean));
+async function buildSingBoxJsonProfile(hostName, targetSub = null, allowInsecure = false) {
     let ports = sysConfig.socketPorts ? sysConfig.socketPorts.split(',').map(s=>s.trim()).filter(Boolean) : ["443"];
     let profiles = getAllProfiles(targetSub);
+    let allHostNames = [...new Set(profiles.flatMap(p => getProfileHostNames(hostName, p)))];
+    await preloadIpFlags(profiles, allHostNames);
     let reqPath = encodeURI(`/${sysConfig.apiRoute}`);
 
     let outboundsArr = [];
@@ -3198,16 +4526,14 @@ function buildSingBoxJsonProfile(hostName, targetSub = null, allowInsecure = fal
     let nameCounts = {};
 
     // Add fake configs
-    let stats = getSubscriptionStats(targetSub);
-    let fake1 = `📊 ${stats.usedStr}`;
-    let fake2 = `📅 ${stats.expiryStr}`;
-    outboundsArr.push({
-        "type": "direct",
-        "tag": fake1
-    });
-    outboundsArr.push({
-        "type": "direct",
-        "tag": fake2
+    let fakeNames = getFakeConfigNames(targetSub);
+    let fakeRefs = [];
+    fakeNames.forEach(name => {
+        outboundsArr.push({
+            "type": "direct",
+            "tag": name
+        });
+        fakeRefs.push(name);
     });
 
     const getUniqueName = (baseName) => {
@@ -3227,21 +4553,33 @@ function buildSingBoxJsonProfile(hostName, targetSub = null, allowInsecure = fal
     };
 
     profiles.forEach(p => {
+        let pips = getEffectivePips(p);
         let effectiveMode = p.userMode || sysConfig.mode;
         let effectivePorts = p.userPorts ? p.userPorts.split(',').map(s=>s.trim()).filter(Boolean) : ports;
         let maxCfg = p.maxConfigs || null;
 
-        allHostNames.forEach(hName => {
-            let allIps = getCleanIps(hName, p.proxyIp);
+        let configIndex = 0;
+        let profileHostNames = getProfileHostNames(hostName, p);
+
+        profileHostNames.forEach(hName => {
+            let ipEntries = getCleanIpsWithNames(hName, p.cleanIp);
+            let allIps = ipEntries.map(e => e.ip);
             let ips = calcEffectiveIps(allIps, maxCfg, effectiveMode, effectivePorts);
+            let ipNameMap = {};
+            ipEntries.forEach(e => { ipNameMap[e.ip] = e.name; });
             effectivePorts.forEach(port => {
                 let sec = getTransportParams(port) === "tls";
                 ips.forEach(ip => {
                     let isVless = effectiveMode === "alpha" || effectiveMode === "both";
                     let isTrojan = effectiveMode === "beta" || effectiveMode === "both";
+                    let selectedProxyIp = null;
+                    if (pips.length > 0) {
+                        selectedProxyIp = pips[configIndex % pips.length];
+                    }
+                    let ipName = ipNameMap[ip] || '';
 
                     if (isVless) {
-                        let tagStr = getConfigName("alpha", p.name, port, hName, ip);
+                        let tagStr = getConfigName("alpha", p.name, port, hName, ip, selectedProxyIp, configIndex, ipName);
                         tagStr = getUniqueName(tagStr);
                         dynamicTags.push(tagStr);
 
@@ -3249,13 +4587,16 @@ function buildSingBoxJsonProfile(hostName, targetSub = null, allowInsecure = fal
                         let payloadVl = { junk: randomJunk, protocol: "vl", mode: "proxyip", panelIPs: [] };
                         let pathStrVl = "/" + btoa(JSON.stringify(payloadVl));
 
+                        let configUuid = generateConfigUuid(p.id, configIndex);
+                        registerConfigEntry(configUuid, p.id, selectedProxyIp || '');
+
                         let ob = {
                             "type": k_vl_mode,
                             "tag": tagStr,
                             "server": ip,
                             "server_port": parseInt(port),
                             "tcp_fast_open": sysConfig.enableOpt1 || false,
-                            "uuid": p.id,
+                            "uuid": configUuid,
                             "packet_encoding": "xudp",
                             "network": "tcp",
                             "tls": {
@@ -3282,7 +4623,7 @@ function buildSingBoxJsonProfile(hostName, targetSub = null, allowInsecure = fal
                     }
 
                     if (isTrojan) {
-                        let tagStr = getConfigName("beta", p.name, port, hName, ip);
+                        let tagStr = getConfigName("beta", p.name, port, hName, ip, selectedProxyIp, configIndex, ipName);
                         tagStr = getUniqueName(tagStr);
                         dynamicTags.push(tagStr);
 
@@ -3290,13 +4631,16 @@ function buildSingBoxJsonProfile(hostName, targetSub = null, allowInsecure = fal
                         let payloadTr = { junk: randomJunk, protocol: "tr", mode: "proxyip", panelIPs: [] };
                         let pathStrTr = "/" + btoa(JSON.stringify(payloadTr));
 
+                        let configUuid2 = generateConfigUuid(p.id, configIndex);
+                        registerConfigEntry(configUuid2, p.id, selectedProxyIp || '');
+
                         let ob = {
                             "type": k_tr_mode,
                             "tag": tagStr,
                             "server": ip,
                             "server_port": parseInt(port),
                             "tcp_fast_open": sysConfig.enableOpt1 || false,
-                            "password": p.id,
+                            "password": configUuid2,
                             "network": "tcp",
                             "tls": {
                                 "enabled": sec,
@@ -3319,6 +4663,32 @@ function buildSingBoxJsonProfile(hostName, targetSub = null, allowInsecure = fal
                             }
                         };
                         outboundsArr.push(ob);
+                    }
+                    configIndex++;
+                    if (sysConfig.enableDirectConfigs && pips.length > 0) {
+                        if (isVless) {
+                            let tagStr = getUniqueName(getConfigName("alpha", p.name, port, hName, ip, null, configIndex, ipName));
+                            dynamicTags.push(tagStr);
+                            let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
+                            let payloadVl = { junk: randomJunk, protocol: "vl", mode: "proxyip", panelIPs: [] };
+                            let pathStrVl = "/" + btoa(JSON.stringify(payloadVl));
+                            let configUuid = generateConfigUuid(p.id, configIndex);
+                            registerConfigEntry(configUuid, p.id, '');
+                            let ob = { "type": k_vl_mode, "tag": tagStr, "server": ip, "server_port": parseInt(port), "tcp_fast_open": sysConfig.enableOpt1 || false, "uuid": configUuid, "packet_encoding": "xudp", "network": "tcp", "tls": { "enabled": sec, "server_name": hName, "insecure": allowInsecure, "alpn": ["http/1.1"], "utls": { "enabled": true, "fingerprint": "randomized" } }, "transport": { "type": "ws", "path": pathStrVl, "max_early_data": 2560, "early_data_header_name": "Sec-WebSocket-Protocol", "headers": { "Host": hName } } };
+                            outboundsArr.push(ob);
+                        }
+                        if (isTrojan) {
+                            let tagStr = getUniqueName(getConfigName("beta", p.name, port, hName, ip, null, configIndex, ipName));
+                            dynamicTags.push(tagStr);
+                            let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
+                            let payloadTr = { junk: randomJunk, protocol: "tr", mode: "proxyip", panelIPs: [] };
+                            let pathStrTr = "/" + btoa(JSON.stringify(payloadTr));
+                            let configUuid2 = generateConfigUuid(p.id, configIndex);
+                            registerConfigEntry(configUuid2, p.id, '');
+                            let ob = { "type": k_tr_mode, "tag": tagStr, "server": ip, "server_port": parseInt(port), "tcp_fast_open": sysConfig.enableOpt1 || false, "password": configUuid2, "network": "tcp", "tls": { "enabled": sec, "server_name": hName, "insecure": allowInsecure, "alpn": ["http/1.1"], "utls": { "enabled": true, "fingerprint": "randomized" } }, "transport": { "type": "ws", "path": pathStrTr, "max_early_data": 2560, "early_data_header_name": "Sec-WebSocket-Protocol", "headers": { "Host": hName } } };
+                            outboundsArr.push(ob);
+                        }
+                        configIndex++;
                     }
                 });
             });
@@ -3415,8 +4785,7 @@ function buildSingBoxJsonProfile(hostName, targetSub = null, allowInsecure = fal
                 "tag": "✅ Selector",
                 "outbounds": [
                     "💦 Best Ping 🚀",
-                    fake1,
-                    fake2,
+                    ...fakeRefs,
                     ...dynamicTags
                 ],
                 "interrupt_exist_connections": false
@@ -3568,6 +4937,29 @@ function getDashboardUI(hasDB) {
           ::-webkit-scrollbar-thumb:hover { background: rgba(99, 102, 241, 0.5); }
           .fade-in { animation: fadeIn 0.3s ease-in-out; }
           @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+          [data-accordion-content] { max-height: 0; overflow: hidden; visibility: hidden; transition: none; }
+          
+          /* GPU-accelerate scroll container */
+          .scroll-content { will-change: transform; -webkit-overflow-scrolling: touch; }
+          
+          /* Pause all animations after dashboard is shown */
+          body.logged-in .lock-pulse::before, body.logged-in .lock-pulse::after,
+          body.logged-in .btn-shimmer::after, body.logged-in .animate-bounce { animation: none !important; }
+          
+          /* Replace inline hover handlers with CSS */
+          .btn-top-bar { transition: border-color 0.15s, color 0.15s; }
+          .btn-top-bar:hover { border-color: rgba(99,102,241,0.4) !important; color: #818cf8 !important; }
+          .login-input { transition: border-color 0.15s, background 0.15s, box-shadow 0.15s; }
+          .login-input:focus { border-color: rgba(99,102,241,0.6) !important; background: rgba(99,102,241,0.06) !important; box-shadow: 0 0 0 3px rgba(99,102,241,0.1) !important; outline: none !important; }
+          .login-input:not(:focus) { border-color: rgba(255,255,255,0.1) !important; background: rgba(255,255,255,0.04) !important; box-shadow: none !important; }
+          .login-btn { transition: box-shadow 0.2s, transform 0.2s; }
+          .login-btn:hover { box-shadow: 0 6px 32px rgba(99,102,241,0.6), inset 0 1px 0 rgba(255,255,255,0.1) !important; transform: translateY(-1px); }
+          .login-btn:not(:hover) { box-shadow: 0 4px 24px rgba(99,102,241,0.4), inset 0 1px 0 rgba(255,255,255,0.1); transform: translateY(0); }
+          .icon-btn { transition: color 0.15s, border-color 0.15s; }
+          .icon-btn:hover { color: #818cf8 !important; }
+          .eye-btn { transition: color 0.15s; }
+          .eye-btn:hover { color: #818cf8 !important; }
+          .eye-btn:not(:hover) { color: rgba(99,102,241,0.5) !important; }
           
           /* Enforce custom dark premium style */
           html.dark, html.dark body {
@@ -3738,11 +5130,11 @@ function getDashboardUI(hasDB) {
       <!-- Global Controls -->
       <div class="fixed top-4 end-4 md:top-5 md:end-5 flex items-center gap-2 z-50">
           <span id="top-version-badge" class="px-3 py-1.5 rounded-xl text-[11px] font-mono font-bold" style="background:rgba(99,102,241,0.12);border:1px solid rgba(99,102,241,0.25);color:#818cf8;">v${CURRENT_VERSION}</span>
-          <a href="https://github.com/itsyebekhe/nahan" id="github-link-btn" target="_blank" class="p-2 rounded-xl transition-all" style="background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);color:#94a3b8;" onmouseover="this.style.color='#818cf8';this.style.borderColor='rgba(99,102,241,0.4)'" onmouseout="this.style.color='#94a3b8';this.style.borderColor='rgba(255,255,255,0.1)'">
+          <a href="https://github.com/itsyebekhe/nahan" id="github-link-btn" target="_blank" class="btn-top-bar p-2 rounded-xl transition-all" style="background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);color:#94a3b8;">
               <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path fill-rule="evenodd" d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z" clip-rule="evenodd"></path></svg>
           </a>
-          <button onclick="toggleLang()" id="lang-toggle" class="px-3 py-1.5 rounded-xl text-sm font-bold transition-all" style="background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);color:#e2e8f0;" onmouseover="this.style.borderColor='rgba(99,102,241,0.4)';this.style.color='#a5b4fc'" onmouseout="this.style.borderColor='rgba(255,255,255,0.1)';this.style.color='#e2e8f0'">EN</button>
-          <button onclick="toggleTheme()" class="p-2 rounded-xl transition-all" style="background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);color:#f59e0b;" onmouseover="this.style.borderColor='rgba(245,158,11,0.4)'" onmouseout="this.style.borderColor='rgba(255,255,255,0.1)'">
+          <button onclick="toggleLang()" id="lang-toggle" class="btn-top-bar px-3 py-1.5 rounded-xl text-sm font-bold transition-all" style="background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);color:#e2e8f0;">EN</button>
+          <button onclick="toggleTheme()" class="btn-top-bar p-2 rounded-xl transition-all" style="background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);color:#f59e0b;">
               <svg class="w-4 h-4 hidden dark:block" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"></path></svg>
               <svg class="w-4 h-4 block dark:hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z"></path></svg>
           </button>
@@ -3787,14 +5179,14 @@ function getDashboardUI(hasDB) {
                               <div class="absolute inset-y-0 start-0 flex items-center ps-4" style="color:rgba(99,102,241,0.7);">
                                   <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z"></path></svg>
                               </div>
-                              <input type="password" id="pwd" data-i18n="pass_ph" placeholder="Enter your password" class="w-full ps-11 pe-12 py-3.5 text-sm rounded-2xl outline-none transition-all" style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);color:#e2e8f0;" onfocus="this.style.borderColor='rgba(99,102,241,0.6)';this.style.background='rgba(99,102,241,0.06)';this.style.boxShadow='0 0 0 3px rgba(99,102,241,0.1)'" onblur="this.style.borderColor='rgba(255,255,255,0.1)';this.style.background='rgba(255,255,255,0.04)';this.style.boxShadow='none'">
-                              <button type="button" onclick="const n=document.getElementById('pwd');n.type=n.type==='password'?'text':'password'" class="absolute inset-y-0 end-0 flex items-center px-4 transition-colors" style="color:rgba(99,102,241,0.5);" onmouseover="this.style.color='#818cf8'" onmouseout="this.style.color='rgba(99,102,241,0.5)'">
+                              <input type="password" id="pwd" data-i18n="pass_ph" placeholder="Enter your password" class="login-input w-full ps-11 pe-12 py-3.5 text-sm rounded-2xl outline-none transition-all" style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);color:#e2e8f0;">
+                              <button type="button" onclick="const n=document.getElementById('pwd');n.type=n.type==='password'?'text':'password'" class="eye-btn absolute inset-y-0 end-0 flex items-center px-4 transition-colors" style="color:rgba(99,102,241,0.5);">
                                   <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"></path></svg>
                               </button>
                           </div>
                       </div>
                       <p id="err-msg" class="hidden text-sm mb-4 flex items-center gap-2 px-3 py-2.5 rounded-xl" style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.2);color:#f87171;"><span>&#9888;&#65039;</span><span data-i18n="err_pass">Wrong password, please try again.</span></p>
-                      <button onclick="doLogin()" class="btn-shimmer w-full py-3.5 rounded-2xl font-bold text-sm relative overflow-hidden transition-all" style="background:linear-gradient(135deg,#6366f1,#7c3aed);color:white;box-shadow:0 4px 24px rgba(99,102,241,0.4),inset 0 1px 0 rgba(255,255,255,0.1);" onmouseover="this.style.boxShadow='0 6px 32px rgba(99,102,241,0.6),inset 0 1px 0 rgba(255,255,255,0.1)';this.style.transform='translateY(-1px)'" onmouseout="this.style.boxShadow='0 4px 24px rgba(99,102,241,0.4),inset 0 1px 0 rgba(255,255,255,0.1)';this.style.transform='translateY(0)'" data-i18n="login_btn">
+                      <button onclick="doLogin()" class="login-btn btn-shimmer w-full py-3.5 rounded-2xl font-bold text-sm relative overflow-hidden transition-all" style="background:linear-gradient(135deg,#6366f1,#7c3aed);color:white;box-shadow:0 4px 24px rgba(99,102,241,0.4),inset 0 1px 0 rgba(255,255,255,0.1);" data-i18n="login_btn">
                           Sign In
                       </button>
                   </div>
@@ -3859,7 +5251,7 @@ function getDashboardUI(hasDB) {
               </header>
   
               <!-- Scrollable Content -->
-              <div class="flex-1 overflow-y-auto p-4 md:p-10">
+              <div class="scroll-content flex-1 overflow-y-auto p-4 md:p-10">
                   <div class="max-w-4xl mx-auto space-y-6 fade-in">
 
                       <!-- Update Banner -->
@@ -3876,9 +5268,26 @@ function getDashboardUI(hasDB) {
                               </div>
                               <div class="flex gap-2 w-full sm:w-auto shrink-0 justify-end">
                                   <button onclick="dismissUpdate()" class="px-4 py-2.5 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800/80 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 font-bold rounded-xl text-xs transition-colors" data-i18n="btn_cancel">Cancel</button>
-                                  <a id="update-alert-btn" href="https://github.com/itsyebekhe/nahan" target="_blank" class="px-5 py-2.5 bg-amber-500 hover:bg-amber-600 text-white font-bold rounded-xl text-xs transition-all shadow-md hover:shadow-lg flex items-center justify-center gap-1.5" data-i18n="update_btn">
-                                      Get Latest Code ➜
-                                  </a>
+                                  <button onclick="doUpdate()" id="update-deploy-btn" class="px-5 py-2.5 bg-amber-500 hover:bg-amber-600 text-white font-bold rounded-xl text-xs transition-all shadow-md hover:shadow-lg flex items-center justify-center gap-1.5" data-i18n="deploy_btn">
+                                      🚀 Deploy Now
+                                  </button>
+                              </div>
+                          </div>
+                          <!-- Sub-options for format choice -->
+                          <div class="w-full flex flex-col md:flex-row items-start md:items-center justify-between gap-4 bg-amber-500/5 dark:bg-amber-500/[0.02] p-4 rounded-2xl border border-amber-500/10 mt-2 text-start">
+                              <div class="space-y-1">
+                                  <span class="text-xs font-bold text-amber-800 dark:text-amber-400" data-i18n="lbl_update_format">Update Format & Obfuscation:</span>
+                                  <p class="text-[10px] text-slate-500 dark:text-slate-400" data-i18n="desc_update_format">Deploy clean source code, or encrypt using dynamic XOR byte-shifting to avoid network interception.</p>
+                              </div>
+                              <div class="flex items-center gap-4 shrink-0 font-medium">
+                                  <label class="inline-flex items-center cursor-pointer">
+                                      <input type="radio" name="update-format" value="normal" checked class="form-radio text-amber-500 w-4 h-4">
+                                      <span class="ms-1.5 text-xs text-slate-700 dark:text-slate-300 font-bold" data-i18n="format_normal">Normal (_worker.js)</span>
+                                  </label>
+                                  <label class="inline-flex items-center cursor-pointer">
+                                      <input type="radio" name="update-format" value="obfuscated" class="form-radio text-amber-500 w-4 h-4">
+                                      <span class="ms-1.5 text-xs text-slate-700 dark:text-slate-300 font-bold" data-i18n="format_obfuscated">Obfuscated (UTF-8 + XOR)</span>
+                                  </label>
                               </div>
                           </div>
                           <!-- Dynamic Changelog Section -->
@@ -3890,6 +5299,10 @@ function getDashboardUI(hasDB) {
                               <div id="update-changelog-content" class="text-xs text-slate-600 dark:text-slate-400 bg-amber-500/[0.04] dark:bg-slate-900/40 p-4 rounded-2xl max-h-48 overflow-y-auto font-sans leading-relaxed border border-amber-200/20 max-w-none text-start">
                                   <p class="animate-pulse">Loading changelog...</p>
                               </div>
+                          </div>
+                          <div id="update-deploy-status" class="hidden w-full mt-3 p-3 rounded-xl text-sm font-bold text-center"></div>
+                          <div class="w-full mt-2 text-center">
+                              <a id="update-github-link" href="https://github.com/itsyebekhe/nahan" target="_blank" class="text-xs text-slate-400 hover:text-amber-500 transition-colors underline" data-i18n="view_github">View on GitHub</a>
                           </div>
                       </div>
 
@@ -3984,7 +5397,7 @@ function getDashboardUI(hasDB) {
                               <div class="bg-white dark:bg-darkcard rounded-2xl md:rounded-3xl p-4 md:p-6 shadow-sm border border-slate-200 dark:border-darkborder">
                                   <h3 class="text-xs md:text-sm uppercase font-bold text-slate-500 tracking-wider mb-3 md:mb-4" data-i18n="ov_quick_actions">Quick Actions</h3>
                                   <div class="grid grid-cols-2 gap-2 md:grid-cols-1 md:gap-3">
-                                      <button onclick="document.getElementById('modal-add-user').classList.remove('hidden'); buildPortCheckboxes('add-user-ports-wrap', null); buildModeCheckboxes('add-user-mode-wrap', null);" class="flex items-center justify-center md:justify-start gap-2 md:gap-3 px-3 py-2.5 md:px-4 md:py-3 bg-primary/10 hover:bg-primary/20 text-primary rounded-lg md:rounded-xl font-bold text-xs md:text-sm transition-colors">
+                                      <button onclick="openAddUserModal()" class="flex items-center justify-center md:justify-start gap-2 md:gap-3 px-3 py-2.5 md:px-4 md:py-3 bg-primary/10 hover:bg-primary/20 text-primary rounded-lg md:rounded-xl font-bold text-xs md:text-sm transition-colors">
                                           <svg class="w-4 h-4 md:w-5 md:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6"></path></svg>
                                           <span data-i18n="ov_add_user">Add User</span>
                                       </button>
@@ -4170,7 +5583,7 @@ function getDashboardUI(hasDB) {
                               <div class="space-y-1 md:col-span-2">
                                   <div class="flex justify-between items-center">
                                       <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_id">Device UUID (Empty=Auto)</label>
-                                      <button type="button" onclick="document.getElementById('cfg-uuid').value = crypto.randomUUID()" class="text-xs text-primary bg-primary/10 hover:bg-primary/20 px-2 py-1 rounded transition-colors duration-200">Generate UUID</button>
+                                      <button type="button" onclick="document.getElementById('cfg-uuid').value = crypto.randomUUID()" class="text-xs text-primary bg-primary/10 hover:bg-primary/20 px-2 py-1 rounded transition-colors duration-200" data-i18n="btn_generate_uuid">Generate UUID</button>
                                   </div>
                                   <input type="text" id="cfg-uuid" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none font-mono text-sm">
                               </div>
@@ -4188,6 +5601,11 @@ function getDashboardUI(hasDB) {
                               <div class="space-y-1 md:col-span-2">
                                   <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_github_repo">GitHub Update Repository</label>
                                   <input type="text" id="cfg-github-repo" placeholder="itsyebekhe/nahan" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
+                                  <div class="flex justify-start items-center gap-2 mt-2">
+                                      <button type="button" onclick="triggerManualRedeploy()" class="inline-flex items-center gap-1.5 px-3 py-1.5 bg-primary/10 hover:bg-primary/20 text-primary text-xs font-bold rounded-lg transition-colors border border-primary/20">
+                                          🔄 <span data-i18n="btn_redeploy_force">Force Redeploy / Switch Format</span>
+                                      </button>
+                                  </div>
                               </div>
                               <div class="space-y-1 md:col-span-2">
                                   <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_sub_ua">Custom Subscription User-Agent</label>
@@ -4199,8 +5617,56 @@ function getDashboardUI(hasDB) {
                                   <input type="text" id="cfg-custom-panel-url" placeholder="e.g. custom.domain.com or https://custom.domain.com" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
                                   <p class="text-xs text-slate-500 mt-1 ms-1" data-i18n="desc_custom_panel_url">Optionally specify a custom domain/URL to be used for subscription/sync links. If empty, the default Worker address will be used.</p>
                               </div>
-  
-                              <!-- Import/Export Config Area -->
+                              <!-- System Toggles -->
+                              <div class="flex flex-col sm:flex-row gap-3 md:col-span-2">
+                                  <label class="flex-1 flex items-center justify-between cursor-pointer bg-slate-50 dark:bg-slate-800/50 p-4 rounded-2xl">
+                                      <span class="text-sm font-bold text-slate-700 dark:text-slate-300" data-i18n="lbl_silent">Silent UI Alerts</span>
+                                      <div class="relative inline-flex items-center cursor-pointer">
+                                          <input type="checkbox" id="cfg-silent" class="sr-only peer">
+                                          <div class="w-11 h-6 bg-slate-300 dark:bg-slate-600 rounded-full peer peer-checked:after:translate-x-5 rtl:peer-checked:after:-translate-x-5 peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-slate-500 peer-checked:bg-primary"></div>
+                                      </div>
+                                  </label>
+                                  <label class="flex-1 flex items-center justify-between cursor-pointer bg-red-50 dark:bg-red-900/10 p-4 rounded-2xl border border-red-200 dark:border-red-900/30">
+                                      <span class="text-sm font-bold text-red-600 dark:text-red-400" data-i18n="lbl_pause">Kill Switch</span>
+                                      <div class="relative inline-flex items-center cursor-pointer">
+                                          <input type="checkbox" id="cfg-pause" class="sr-only peer">
+                                          <div class="w-11 h-6 bg-red-200 dark:bg-red-900/50 rounded-full peer peer-checked:after:translate-x-5 rtl:peer-checked:after:-translate-x-5 peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-slate-500 peer-checked:bg-red-500"></div>
+                                      </div>
+                                  </label>
+                               </div>
+                               <div class="space-y-3 md:col-span-2">
+                                   <label class="flex items-center justify-between bg-emerald-50 dark:bg-emerald-900/10 p-4 rounded-2xl border border-emerald-200 dark:border-emerald-900/30 cursor-pointer">
+                                       <div>
+                                           <span class="text-sm font-bold text-emerald-700 dark:text-emerald-400" data-i18n="lbl_auto_update">Auto-Update</span>
+                                           <p class="text-[10px] text-emerald-500/70 dark:text-emerald-400/60 mt-0.5">Automatically deploy when a new version is detected</p>
+                                       </div>
+                                       <div class="relative inline-flex items-center">
+                                           <input type="checkbox" id="cfg-auto-update" class="sr-only peer">
+                                           <div class="w-11 h-6 bg-slate-300 dark:bg-slate-600 rounded-full peer peer-checked:after:translate-x-5 rtl:peer-checked:after:-translate-x-5 peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-slate-500 peer-checked:bg-emerald-500"></div>
+                                       </div>
+                                   </label>
+                                   <div id="auto-update-format-wrap" class="hidden">
+                                       <label class="block text-xs font-bold text-slate-500 mb-2" data-i18n="lbl_auto_update_format">Update Format</label>
+                                       <div class="flex gap-3">
+                                           <label class="flex-1 flex items-center gap-2 p-3 bg-slate-50 dark:bg-slate-800/50 rounded-xl border border-slate-200 dark:border-darkborder cursor-pointer hover:border-emerald-400 transition-colors">
+                                               <input type="radio" name="auto-update-format" value="normal" checked class="accent-emerald-500">
+                                               <div>
+                                               <span class="text-xs font-bold text-slate-700 dark:text-slate-300" data-i18n="format_normal_label">Normal</span>
+                                               <p class="text-[10px] text-slate-400" data-i18n="desc_format_normal">Standard _worker.js</p>
+                                               </div>
+                                           </label>
+                                           <label class="flex-1 flex items-center gap-2 p-3 bg-slate-50 dark:bg-slate-800/50 rounded-xl border border-slate-200 dark:border-darkborder cursor-pointer hover:border-emerald-400 transition-colors">
+                                               <input type="radio" name="auto-update-format" value="obfuscated" class="accent-emerald-500">
+                                               <div>
+                                               <span class="text-xs font-bold text-slate-700 dark:text-slate-300" data-i18n="format_obfuscated_label">Obfuscated</span>
+                                               <p class="text-[10px] text-slate-400" data-i18n="desc_format_obfuscated">XOR byte-shifting</p>
+                                               </div>
+                                           </label>
+                                       </div>
+                                   </div>
+                               </div>
+
+                               <!-- Import/Export Config Area -->
                               <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder md:col-span-2 space-y-4">
                                   <h3 class="text-sm uppercase font-bold text-slate-400 tracking-wider" data-i18n="backup_restore_title">Backup & Restore</h3>
                                   <div class="flex flex-col sm:flex-row gap-4">
@@ -4217,196 +5683,298 @@ function getDashboardUI(hasDB) {
                       </div>
   
                       <!-- ADVANCED VIEW -->
-                      <div id="view-advanced" class="hidden space-y-6">
-                          <!-- Multi Clean IP Section -->
-                          <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder mb-4">
-                              <div class="flex items-center justify-between mb-4">
-                                  <h3 class="text-sm uppercase font-bold text-slate-500 tracking-wider" data-i18n="lbl_clean_ips">Clean IPs (Multi-Generator)</h3>
-                                  <span class="text-xs bg-indigo-100 dark:bg-indigo-900/50 text-indigo-700 dark:text-indigo-300 px-2 py-1 rounded-md font-bold" id="ip-count-badge">1 Config Set</span>
-                              </div>
-                              <textarea id="cfg-ips" rows="3" data-i18n="ph_clean_ips" placeholder="" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary focus:ring-1 outline-none font-mono text-sm resize-none"></textarea>
-                              <p class="text-xs text-slate-400 mt-2" data-i18n="desc_clean_ips">Put one IP per line. The Sync URL will multiply configs for all IPs.</p>
-                          </div>
-                          
-                          <!-- Slave Nodes Section -->
-                          <div class="bg-indigo-50 dark:bg-indigo-900/20 rounded-3xl p-6 shadow-sm border border-indigo-100 dark:border-indigo-900/50 relative overflow-hidden">
-                              <div class="absolute top-0 end-0 bg-indigo-100 dark:bg-indigo-900/40 px-3 py-1 text-[10px] font-bold text-indigo-500 dark:text-indigo-400 rounded-bl-xl">CLUSTER</div>
-                              <div class="flex items-center justify-between mb-2">
-                                  <h3 class="text-sm uppercase font-black text-indigo-800 dark:text-indigo-300 tracking-wider flex items-center">
-                                      <svg class="w-5 h-5 me-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19.428 15.428a2 2 0 00-1.022-.547l-2.387-.477a6 6 0 00-3.86.517l-.318.158a6 6 0 01-3.86.517L6.05 15.21a2 2 0 00-1.806.547M8 4h8l-1 1v5.172a2 2 0 00.586 1.414l5 5c1.26 1.26.367 3.414-1.415 3.414H4.828c-1.782 0-2.674-2.154-1.414-3.414l5-5A2 2 0 009 10.172V5L8 4z"></path></svg>
-                                      <span data-i18n="slave_title">Slave Worker Nodes</span>
-                                  </h3>
-                              </div>
-                              <p class="text-xs text-indigo-600/80 dark:text-indigo-300/70 mb-4 leading-relaxed" data-i18n="slave_desc">Enter your other worker Domains (one per line). Master will push settings and users to them automatically, and include them in load-balanced subscriptions!</p>
-                              <div class="relative">
-                                  <textarea id="cfg-nodes" rows="3" placeholder="node1.worker.dev&#10;node2.domain.com" class="w-full px-4 py-3 pb-12 rounded-xl border border-indigo-200 dark:border-indigo-800/50 bg-white dark:bg-slate-900 focus:border-indigo-500 focus:ring-1 outline-none font-mono text-sm resize-none scrollbar-hide text-slate-700 dark:text-slate-300 placeholder:text-indigo-200 dark:placeholder:text-indigo-800/50"></textarea>
-                                  <div class="absolute bottom-3 end-3">
-                                      <button onclick="forceSyncNodes()" type="button" class="px-3 py-1.5 bg-indigo-500 hover:bg-indigo-600 text-white text-xs font-bold rounded-lg transition-colors flex items-center shadow-sm">
-                                          <svg id="sync-icon" class="w-3.5 h-3.5 me-1.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
-                                          <span id="sync-btn-txt" data-i18n="force_sync">Force Sync Now</span>
-                                      </button>
+                      <div id="view-advanced" class="hidden space-y-4">
+
+                          <!-- Section: Network & DNS -->
+                          <div class="bg-white dark:bg-darkcard rounded-2xl border border-slate-200 dark:border-darkborder overflow-hidden" data-accordion>
+                              <button onclick="toggleAccordion(this)" class="w-full flex items-center justify-between px-5 py-4 hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors">
+                                  <div class="flex items-center gap-3">
+                                      <span class="text-lg">🌐</span>
+                                      <span class="text-sm font-bold text-slate-700 dark:text-slate-200" data-i18n="adv_network_dns">Network & DNS</span>
+                                  </div>
+                                  <svg class="w-4 h-4 text-slate-400 transform transition-transform duration-200 accordion-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                              </button>
+                              <div data-accordion-content class="transition-all duration-300" style="max-height:0;overflow:hidden;visibility:hidden">
+                                  <div class="space-y-4 px-5 pb-5 pt-1">
+                                      <div>
+                                          <div class="flex items-center justify-between mb-2">
+                                              <label class="text-sm font-bold text-slate-600 dark:text-slate-300" data-i18n="lbl_clean_ips">Clean IPs (Multi-Generator)</label>
+                                              <span class="text-xs bg-indigo-100 dark:bg-indigo-900/50 text-indigo-700 dark:text-indigo-300 px-2 py-1 rounded-md font-bold" id="ip-count-badge">1 Config Set</span>
+                                          </div>
+                                          <textarea id="cfg-ips" rows="3" data-i18n="ph_clean_ips" placeholder="1.2.3.4#Germany&#10;5.6.7.8#US&#10;9.10.11.12#France" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary focus:ring-1 outline-none font-mono text-sm resize-none"></textarea>
+                                          <p class="text-xs text-slate-400 mt-2" data-i18n="desc_clean_ips">One IP per line. Use <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">IP#Name</code> format to tag IPs (e.g. <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">1.2.3.4#Germany</code>). Use <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">{IP_NAME}</code> in name strategy.</p>
+                                          <button id="btn-resolve-smart-ips" onclick="resolveSmartCleanIps()" class="mt-3 w-full sm:w-auto px-4 py-2.5 bg-primary/10 hover:bg-primary/20 text-primary border border-primary/20 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-2">
+                                              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+                                              Auto-Resolve CDN & Clean IPs
+                                          </button>
+                                      </div>
+                                      <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                          <div class="space-y-1">
+                                              <label class="block text-sm font-bold text-slate-600 dark:text-slate-300" data-i18n="lbl_fp">TLS Signature</label>
+                                              <select id="cfg-fp" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none appearance-none">
+                                                  <option value="chrome">Chrome</option><option value="firefox">Firefox</option><option value="safari">Safari</option>
+                                              </select>
+                                          </div>
+                                          <div class="space-y-1">
+                                              <label class="block text-sm font-bold text-slate-600 dark:text-slate-300" data-i18n="lbl_dns">Resolver IP</label>
+                                              <input type="text" id="cfg-dns" placeholder="1.1.1.1" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
+                                          </div>
+                                          <div class="space-y-1 md:col-span-2">
+                                              <label class="block text-sm font-bold text-slate-600 dark:text-slate-300" data-i18n="lbl_doh">Custom DNS (DoH Provider)</label>
+                                              <input type="text" id="cfg-custom-dns" placeholder="https://cloudflare-dns.com/dns-query" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
+                                          </div>
+                                      </div>
                                   </div>
                               </div>
-                          </div>
-  
-                          <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder grid grid-cols-1 md:grid-cols-2 gap-5">
-                              <div class="space-y-1 text-start">
-                                  <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_fp">TLS Signature</label>
-                                  <select id="cfg-fp" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none appearance-none">
-                                      <option value="chrome">Chrome</option><option value="firefox">Firefox</option><option value="safari">Safari</option>
-                                  </select>
-                              </div>
-                              <div class="space-y-1 text-start">
-                                  <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_dns">Resolver IP</label>
-                                  <input type="text" id="cfg-dns" placeholder="1.1.1.1" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                              </div>
-                              <div class="space-y-1 text-start">
-                                  <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_doh">Custom DNS (DoH Provider)</label>
-                                  <input type="text" id="cfg-custom-dns" placeholder="https://cloudflare-dns.com/dns-query" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                              </div>
-                              <div class="space-y-1 md:col-span-2 text-start">
-                                  <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_fake">Maintenance Hosts (Camouflage)</label>
-                                  <input type="text" id="cfg-fake" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                              </div>
-                              <div class="space-y-1 md:col-span-2 text-start">
-                                  <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_relay">Backup Relay IP</label>
-                                  <input type="text" id="cfg-relay" placeholder="proxyip.cmliussss.net" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                              </div>
-                          </div>
-  
-                          <!-- Custom Name Strategy -->
-                          <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder grid grid-cols-1 md:grid-cols-2 gap-5 mt-6">
-                              <div class="space-y-1 text-start">
-                                  <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_strategy">Configuration Name Strategy</label>
-                                  <select id="cfg-name-strategy" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none appearance-none">
-                                      <option value="default">Default Core Name (e.g. V-Core-443-User)</option>
-                                      <option value="type-user-port">Protocol-User-Port (e.g. vless-User-443)</option>
-                                      <option value="user-port">User-Port (e.g. User-443)</option>
-                                      <option value="host-port-user">Hostname-Port-User</option>
-                                      <option value="prefix-user-port">Custom Prefix-User-Port</option>
-                                  </select>
-                              </div>
-                              <div class="space-y-1 text-start">
-                                  <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_prefix">Custom Name Prefix</label>
-                                  <input type="text" id="cfg-name-prefix" placeholder="Core" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                              </div>
-                          </div>
-  
-                          <div class="flex flex-col sm:flex-row gap-4 p-4 bg-white dark:bg-darkcard rounded-3xl border border-slate-200 dark:border-darkborder">
-                              <!-- TCP Fast Open Toggle -->
-                              <label class="flex-1 flex items-center justify-between sm:justify-start cursor-pointer group bg-slate-50 dark:bg-slate-800/50 p-3 rounded-2xl">
-                                  <span class="text-sm font-bold text-slate-700 dark:text-slate-300 sm:me-4" data-i18n="lbl_tfo">TCP Fast Open</span>
-                                  <div class="relative inline-flex items-center cursor-pointer">
-                                      <input type="checkbox" id="cfg-tfo" class="sr-only peer">
-                                      <div class="w-11 h-6 bg-slate-300 dark:bg-slate-600 rounded-full peer peer-checked:after:translate-x-5 rtl:peer-checked:after:-translate-x-5 peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-slate-500 peer-checked:bg-primary"></div>
-                                  </div>
-                              </label>
-                              <!-- Secure Hello (ECH) Toggle -->
-                              <label class="flex-1 flex items-center justify-between sm:justify-start cursor-pointer group bg-slate-50 dark:bg-slate-800/50 p-3 rounded-2xl">
-                                  <span class="text-sm font-bold text-slate-700 dark:text-slate-300 sm:me-4" data-i18n="lbl_ech">Secure Hello (ECH)</span>
-                                  <div class="relative inline-flex items-center cursor-pointer">
-                                      <input type="checkbox" id="cfg-ech" class="sr-only peer">
-                                      <div class="w-11 h-6 bg-slate-300 dark:bg-slate-600 rounded-full peer peer-checked:after:translate-x-5 rtl:peer-checked:after:-translate-x-5 peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-slate-500 peer-checked:bg-primary"></div>
-                                  </div>
-                              </label>
                           </div>
 
-                          <div class="flex flex-col sm:flex-row gap-4 p-4 bg-white dark:bg-darkcard rounded-3xl border border-slate-200 dark:border-darkborder mt-6">
-                              <!-- Silent Alert Toggle -->
-                              <label class="flex-1 flex items-center justify-between sm:justify-start cursor-pointer group bg-slate-50 dark:bg-slate-800/50 p-3 rounded-2xl">
-                                  <span class="text-sm font-bold text-slate-700 dark:text-slate-300 sm:me-4" data-i18n="lbl_silent">Silent UI Alerts</span>
-                                  <div class="relative inline-flex items-center cursor-pointer">
-                                      <input type="checkbox" id="cfg-silent" class="sr-only peer">
-                                      <div class="w-11 h-6 bg-slate-300 dark:bg-slate-600 rounded-full peer peer-checked:after:translate-x-5 rtl:peer-checked:after:-translate-x-5 peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-slate-500 peer-checked:bg-primary"></div>
+                          <!-- Section: Proxy & Relay -->
+                          <div class="bg-white dark:bg-darkcard rounded-2xl border border-slate-200 dark:border-darkborder overflow-hidden" data-accordion>
+                              <button onclick="toggleAccordion(this)" class="w-full flex items-center justify-between px-5 py-4 hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors">
+                                  <div class="flex items-center gap-3">
+                                      <span class="text-lg">🔗</span>
+                                      <span class="text-sm font-bold text-slate-700 dark:text-slate-200" data-i18n="adv_proxy_relay">Proxy & Relay</span>
                                   </div>
-                              </label>
-                              <!-- Pause Kill Switch Toggle -->
-                              <label class="flex-1 flex items-center justify-between sm:justify-start cursor-pointer group bg-red-50 dark:bg-red-900/10 p-3 rounded-2xl border border-red-200 dark:border-red-900/30">
-                                  <span class="text-sm font-bold text-red-600 dark:text-red-400 sm:me-4" data-i18n="lbl_pause">Kill Switch (Pause System)</span>
-                                  <div class="relative inline-flex items-center cursor-pointer">
-                                      <input type="checkbox" id="cfg-pause" class="sr-only peer">
-                                      <div class="w-11 h-6 bg-red-200 dark:bg-red-900/50 rounded-full peer peer-checked:after:translate-x-5 rtl:peer-checked:after:-translate-x-5 peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-slate-500 peer-checked:bg-red-500"></div>
+                                  <svg class="w-4 h-4 text-slate-400 transform transition-transform duration-200 accordion-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                              </button>
+                              <div data-accordion-content class="transition-all duration-300" style="max-height:0;overflow:hidden;visibility:hidden">
+                                  <div class="space-y-4 px-5 pb-5 pt-1">
+                                      <div class="space-y-1">
+                                          <label class="block text-sm font-bold text-slate-600 dark:text-slate-300" data-i18n="lbl_relay">Proxy IPs (Comma/Newline separated)</label>
+                                          <textarea id="cfg-relay" rows="3" placeholder="104.20.0.1&#10;proxyip.cmliussss.net" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary focus:ring-1 outline-none font-mono text-sm resize-none"></textarea>
+                                      </div>
+                                      <div class="space-y-1">
+                                          <label class="block text-sm font-bold text-slate-600 dark:text-slate-300" data-i18n="lbl_fake">Maintenance Hosts (Camouflage)</label>
+                                          <input type="text" id="cfg-fake" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
+                                      </div>
+                                      <div class="space-y-1">
+                                          <label class="block text-sm font-bold text-slate-600 dark:text-slate-300" data-i18n="lbl_nat64">NAT64 Prefix</label>
+                                          <textarea id="cfg-nat64" rows="2" placeholder="64:ff9b::/96&#10;2001:db8:64::/96" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary focus:ring-1 outline-none font-mono text-sm resize-none"></textarea>
+                                          <p class="text-xs text-slate-400 mt-1" data-i18n="desc_nat64">Optional. Converts IPv4 Proxy IPs to NAT64 IPv6 addresses. Supports multiple prefixes (one per line).</p>
+                                      </div>
+                                      <label class="flex items-center justify-between cursor-pointer bg-slate-50 dark:bg-slate-800/50 p-4 rounded-2xl">
+                                          <div>
+                                              <span class="text-sm font-bold text-slate-700 dark:text-slate-300" data-i18n="lbl_direct_configs">Include Direct Configs</span>
+                                              <p class="text-[10px] text-slate-400 mt-0.5">Generate configs without Proxy IP alongside relay configs</p>
+                                          </div>
+                                          <div class="relative inline-flex items-center cursor-pointer">
+                                              <input type="checkbox" id="cfg-direct-configs" class="sr-only peer">
+                                              <div class="w-11 h-6 bg-slate-300 dark:bg-slate-600 rounded-full peer peer-checked:after:translate-x-5 rtl:peer-checked:after:-translate-x-5 peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-slate-500 peer-checked:bg-primary"></div>
+                                          </div>
+                                      </label>
                                   </div>
-                              </label>
+                              </div>
                           </div>
 
-                          <!-- Telegram Bot Section -->
-                          <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder grid grid-cols-1 md:grid-cols-2 gap-5 mt-6">
-                              <div class="space-y-1 text-start">
-                                  <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_tg_token">Token Bot</label>
-                                  <div class="relative">
-                                      <input type="password" id="cfg-tg-token" placeholder="123456:ABC-DEF1234ghIkl-zyx5c" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm pe-12">
-                                      <button type="button" onclick="const n=document.getElementById('cfg-tg-token');n.type=n.type==='password'?'text':'password'" class="absolute inset-y-0 end-0 flex items-center px-4 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200">👁️</button>
+                          <!-- Section: Subscription -->
+                          <div class="bg-white dark:bg-darkcard rounded-2xl border border-slate-200 dark:border-darkborder overflow-hidden" data-accordion>
+                              <button onclick="toggleAccordion(this)" class="w-full flex items-center justify-between px-5 py-4 hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors">
+                                  <div class="flex items-center gap-3">
+                                      <span class="text-lg">📝</span>
+                                      <span class="text-sm font-bold text-slate-700 dark:text-slate-200" data-i18n="adv_subscription">Subscription</span>
+                                  </div>
+                                  <svg class="w-4 h-4 text-slate-400 transform transition-transform duration-200 accordion-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                              </button>
+                              <div data-accordion-content class="transition-all duration-300" style="max-height:0;overflow:hidden;visibility:hidden">
+                                  <div class="space-y-4 px-5 pb-5 pt-1">
+                                      <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                          <div class="space-y-1">
+                                              <label class="block text-sm font-bold text-slate-600 dark:text-slate-300" data-i18n="lbl_strategy">Configuration Name Strategy</label>
+                                              <input type="text" id="cfg-name-strategy" placeholder="{FLAG} {PROTOCOL}-{USER}-{PORT}" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
+                                              <p data-i18n="html_desc_strategy" class="text-[11px] text-slate-400 dark:text-slate-500 mt-1 leading-relaxed">
+                                                  Supported templates: <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">default</code>, <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">type-user-port</code>, <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">user-port</code>, <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">host-port-user</code>, <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">prefix-user-port</code>, <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">ip</code>. Tags: <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">{FLAG}</code> <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">{IP_NAME}</code> <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">{USER}</code> <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">{PORT}</code>
+                                              </p>
+                                          </div>
+                                          <div class="space-y-1">
+                                              <label class="block text-sm font-bold text-slate-600 dark:text-slate-300" data-i18n="lbl_prefix">Custom Name Prefix</label>
+                                              <input type="text" id="cfg-name-prefix" placeholder="Core" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
+                                          </div>
+                                       </div>
+                                       <div class="border-t border-slate-100 dark:border-darkborder pt-4">
+                                          <div class="flex items-center justify-between mb-3">
+                                              <div>
+                                                  <h4 class="text-sm font-bold text-slate-600 dark:text-slate-300" data-i18n="lbl_fake_configs">Subscription Fake Entries</h4>
+                                                  <p class="text-[11px] text-slate-400 dark:text-slate-500 mt-0.5" data-i18n="desc_fake_configs">Customize info entries shown in subscription profiles. Use <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">{usage}</code> and <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">{expiry}</code> for dynamic values.</p>
+                                              </div>
+                                              <button onclick="addFakeConfig()" class="px-3 py-1.5 bg-primary/10 hover:bg-primary/20 text-primary border border-primary/20 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 shrink-0">
+                                                  <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6"></path></svg>
+                                                  <span data-i18n="btn_add_entry">Add Entry</span>
+                                              </button>
+                                          </div>
+                                          <div id="fake-configs-list" class="space-y-2"></div>
+                                      </div>
                                   </div>
                               </div>
-                              <div class="space-y-1 text-start">
-                                  <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_tg_chat">Chat ID</label>
-                                  <input type="text" id="cfg-tg-chat" placeholder="123456789" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                              </div>
-                              <div class="space-y-1 text-start">
-                                  <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_tg_admin">Authorized Telegram Admin ID</label>
-                                  <input type="text" id="cfg-tg-admin" placeholder="123456789" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                  <p class="text-xs text-slate-400 mt-1" data-i18n="desc_tg_admin">Only this Telegram User ID can manage the panel via bot. Leave empty to use Chat ID.</p>
-                              </div>
-                              <p class="text-xs text-slate-400 md:col-span-2" data-i18n="desc_tg_bot">Set these values to receive login alerts via Telegram.</p>
                           </div>
-                          
-                          <!-- Cloudflare Usage Analytics -->
-                          <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder grid grid-cols-1 md:grid-cols-2 gap-5 mt-6">
-                              <div class="space-y-1 text-start">
-                                  <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_cf_acc">CF Account ID</label>
-                                  <input type="text" id="cfg-cf-acc" placeholder="a1b2c3d4e5f6..." class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm font-mono">
-                              </div>
-                              <div class="space-y-1 text-start">
-                                  <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_cf_token">CF API Token</label>
-                                  <div class="relative">
-                                      <input type="password" id="cfg-cf-token" placeholder="Bearer Token (Read Analytics)" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm font-mono pe-12">
-                                      <button type="button" onclick="const n=document.getElementById('cfg-cf-token');n.type=n.type==='password'?'text':'password'" class="absolute inset-y-0 end-0 flex items-center px-4 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200">👁️</button>
+
+                          <!-- Section: Protocol -->
+                          <div class="bg-white dark:bg-darkcard rounded-2xl border border-slate-200 dark:border-darkborder overflow-hidden" data-accordion>
+                              <button onclick="toggleAccordion(this)" class="w-full flex items-center justify-between px-5 py-4 hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors">
+                                  <div class="flex items-center gap-3">
+                                      <span class="text-lg">⚡</span>
+                                      <span class="text-sm font-bold text-slate-700 dark:text-slate-200" data-i18n="adv_protocol">Protocol</span>
+                                  </div>
+                                  <svg class="w-4 h-4 text-slate-400 transform transition-transform duration-200 accordion-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                              </button>
+                              <div data-accordion-content class="transition-all duration-300" style="max-height:0;overflow:hidden;visibility:hidden">
+                                  <div class="flex flex-col sm:flex-row gap-3">
+                                      <label class="flex-1 flex items-center justify-between cursor-pointer bg-slate-50 dark:bg-slate-800/50 p-4 rounded-2xl">
+                                          <span class="text-sm font-bold text-slate-700 dark:text-slate-300" data-i18n="lbl_tfo">TCP Fast Open</span>
+                                          <div class="relative inline-flex items-center cursor-pointer">
+                                              <input type="checkbox" id="cfg-tfo" class="sr-only peer">
+                                              <div class="w-11 h-6 bg-slate-300 dark:bg-slate-600 rounded-full peer peer-checked:after:translate-x-5 rtl:peer-checked:after:-translate-x-5 peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-slate-500 peer-checked:bg-primary"></div>
+                                          </div>
+                                      </label>
+                                      <label class="flex-1 flex items-center justify-between cursor-pointer bg-slate-50 dark:bg-slate-800/50 p-4 rounded-2xl">
+                                          <span class="text-sm font-bold text-slate-700 dark:text-slate-300" data-i18n="lbl_ech">Secure Hello (ECH)</span>
+                                          <div class="relative inline-flex items-center cursor-pointer">
+                                              <input type="checkbox" id="cfg-ech" class="sr-only peer">
+                                              <div class="w-11 h-6 bg-slate-300 dark:bg-slate-600 rounded-full peer peer-checked:after:translate-x-5 rtl:peer-checked:after:-translate-x-5 peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-slate-500 peer-checked:bg-primary"></div>
+                                          </div>
+                                      </label>
                                   </div>
                               </div>
-                              <p class="text-xs text-slate-400 md:col-span-2" data-i18n="desc_cf_api">Optional: Monitor Worker free usage limits (100k/day). Needs Account Analytics Read permission.</p>
                           </div>
+
+                          <!-- Section: Cluster -->
+                          <div class="bg-indigo-50 dark:bg-indigo-950/20 rounded-2xl border border-indigo-100 dark:border-indigo-900/50 overflow-hidden" data-accordion>
+                              <button onclick="toggleAccordion(this)" class="w-full flex items-center justify-between px-5 py-4 hover:bg-indigo-100/50 dark:hover:bg-indigo-900/30 transition-colors">
+                                  <div class="flex items-center gap-3">
+                                      <span class="text-lg">🔬</span>
+                                      <span class="text-sm font-bold text-indigo-700 dark:text-indigo-300" data-i18n="slave_title">Slave Worker Nodes</span>
+                                  </div>
+                                  <svg class="w-4 h-4 text-indigo-400 transform transition-transform duration-200 accordion-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                              </button>
+                              <div data-accordion-content class="transition-all duration-300" style="max-height:0;overflow:hidden;visibility:hidden">
+                                  <div class="space-y-3 px-5 pb-5 pt-1">
+                                      <p class="text-xs text-indigo-600/80 dark:text-indigo-300/70 leading-relaxed" data-i18n="slave_desc">Enter your other worker Domains (one per line). Master will push settings and users to them automatically, and include them in load-balanced subscriptions!</p>
+                                      <div class="relative">
+                                          <textarea id="cfg-nodes" rows="3" placeholder="node1.worker.dev&#10;node2.domain.com" class="w-full px-4 py-3 pb-12 rounded-xl border border-indigo-200 dark:border-indigo-800/50 bg-white dark:bg-slate-900 focus:border-indigo-500 focus:ring-1 outline-none font-mono text-sm resize-none text-slate-700 dark:text-slate-300 placeholder:text-indigo-300 dark:placeholder:text-indigo-800/50"></textarea>
+                                          <div class="absolute bottom-3 end-3">
+                                              <button onclick="forceSyncNodes()" type="button" class="px-3 py-1.5 bg-indigo-500 hover:bg-indigo-600 text-white text-xs font-bold rounded-lg transition-colors flex items-center shadow-sm">
+                                                  <svg id="sync-icon" class="w-3.5 h-3.5 me-1.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+                                                  <span id="sync-btn-txt" data-i18n="force_sync">Force Sync Now</span>
+                                              </button>
+                                          </div>
+                                      </div>
+                                      <label class="flex items-center justify-between cursor-pointer bg-white dark:bg-slate-800/50 p-3 rounded-2xl">
+                                          <span class="text-sm font-bold text-slate-700 dark:text-slate-300" data-i18n="lbl_allow_sync">Allow Sync</span>
+                                          <div class="relative inline-flex items-center cursor-pointer">
+                                              <input type="checkbox" id="cfg-allow-sync" class="sr-only peer">
+                                              <div class="w-11 h-6 bg-slate-300 dark:bg-slate-600 rounded-full peer peer-checked:after:translate-x-5 rtl:peer-checked:after:-translate-x-5 peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-slate-500 peer-checked:bg-primary"></div>
+                                          </div>
+                                      </label>
+                                  </div>
+                              </div>
+                          </div>
+
+                          <!-- Section: Telegram -->
+                          <div class="bg-white dark:bg-darkcard rounded-2xl border border-slate-200 dark:border-darkborder overflow-hidden" data-accordion>
+                              <button onclick="toggleAccordion(this)" class="w-full flex items-center justify-between px-5 py-4 hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors">
+                                  <div class="flex items-center gap-3">
+                                      <span class="text-lg">🤖</span>
+                                      <span class="text-sm font-bold text-slate-700 dark:text-slate-200" data-i18n="adv_telegram">Telegram Bot</span>
+                                  </div>
+                                  <svg class="w-4 h-4 text-slate-400 transform transition-transform duration-200 accordion-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                              </button>
+                              <div data-accordion-content class="transition-all duration-300" style="max-height:0;overflow:hidden;visibility:hidden">
+                                  <div class="space-y-3 px-5 pb-5 pt-1">
+                                      <div class="space-y-1">
+                                          <label class="block text-sm font-bold text-slate-600 dark:text-slate-300" data-i18n="lbl_tg_token">Bot Token</label>
+                                          <div class="relative">
+                                              <input type="password" id="cfg-tg-token" placeholder="123456:ABC-DEF1234ghIkl-zyx5c" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm pe-12">
+                                              <button type="button" onclick="const n=document.getElementById('cfg-tg-token');n.type=n.type==='password'?'text':'password'" class="absolute inset-y-0 end-0 flex items-center px-4 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200">👁️</button>
+                                          </div>
+                                      </div>
+                                      <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                          <div class="space-y-1">
+                                              <label class="block text-sm font-bold text-slate-600 dark:text-slate-300" data-i18n="lbl_tg_chat">Chat ID</label>
+                                              <input type="text" id="cfg-tg-chat" placeholder="123456789" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
+                                          </div>
+                                          <div class="space-y-1">
+                                              <label class="block text-sm font-bold text-slate-600 dark:text-slate-300" data-i18n="lbl_tg_admin">Authorized Admin ID</label>
+                                              <input type="text" id="cfg-tg-admin" placeholder="123456789" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
+                                              <p class="text-xs text-slate-400" data-i18n="desc_tg_admin">Only this Telegram User ID can manage the panel via bot. Leave empty to use Chat ID.</p>
+                                          </div>
+                                      </div>
+                                      <p class="text-xs text-slate-400" data-i18n="desc_tg_bot">Set these values to receive login alerts via Telegram.</p>
+                                  </div>
+                              </div>
+                          </div>
+
+                          <!-- Section: Cloudflare -->
+                          <div class="bg-white dark:bg-darkcard rounded-2xl border border-slate-200 dark:border-darkborder overflow-hidden" data-accordion>
+                              <button onclick="toggleAccordion(this)" class="w-full flex items-center justify-between px-5 py-4 hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors">
+                                  <div class="flex items-center gap-3">
+                                      <span class="text-lg">☁️</span>
+                                      <span class="text-sm font-bold text-slate-700 dark:text-slate-200" data-i18n="adv_cloudflare">Cloudflare</span>
+                                  </div>
+                                  <svg class="w-4 h-4 text-slate-400 transform transition-transform duration-200 accordion-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                              </button>
+                              <div data-accordion-content class="transition-all duration-300" style="max-height:0;overflow:hidden;visibility:hidden">
+                                  <div class="space-y-3 px-5 pb-5 pt-1">
+                                      <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                          <div class="space-y-1">
+                                              <label class="block text-sm font-bold text-slate-600 dark:text-slate-300" data-i18n="lbl_cf_acc">CF Account ID</label>
+                                              <input type="text" id="cfg-cf-acc" placeholder="a1b2c3d4e5f6..." class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm font-mono">
+                                          </div>
+                                          <div class="space-y-1">
+                                              <label class="block text-sm font-bold text-slate-600 dark:text-slate-300" data-i18n="lbl_cf_token">CF API Token</label>
+                                              <div class="relative">
+                                                  <input type="password" id="cfg-cf-token" placeholder="Bearer Token (Read Analytics)" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm font-mono pe-12">
+                                                  <button type="button" onclick="const n=document.getElementById('cfg-cf-token');n.type=n.type==='password'?'text':'password'" class="absolute inset-y-0 end-0 flex items-center px-4 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200">👁️</button>
+                                              </div>
+                                          </div>
+                                      </div>
+                                      <div class="space-y-1">
+                                          <label class="block text-sm font-bold text-slate-600 dark:text-slate-300" data-i18n="lbl_cf_worker">CF Worker Script Name</label>
+                                          <input type="text" id="cfg-cf-worker" placeholder="e.g. nahan" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm font-mono">
+                                          <p class="text-xs text-slate-400" data-i18n="desc_cf_worker">Required for in-panel updates. The script name shown in your Cloudflare Workers dashboard.</p>
+                                      </div>
+                                      <p class="text-xs text-slate-400" data-i18n="desc_cf_api">Optional: Monitor Worker free usage limits (100k/day). Needs Account Analytics Read permission.</p>
+                                      <div class="border-t border-slate-100 dark:border-darkborder pt-3">
+                                          <button type="button" onclick="document.getElementById('cf-helper-guide').classList.toggle('hidden')" class="w-full text-start px-4 py-3 bg-primary/10 hover:bg-primary/15 text-primary text-xs font-bold rounded-xl flex items-center justify-between transition-colors">
+                                              <span class="flex items-center gap-1.5">
+                                                  💡 <span data-i18n="cf_help_title">Need help getting these? Beginner's Guide</span>
+                                              </span>
+                                              <span class="text-[10px] transform transition-transform duration-200">▼</span>
+                                          </button>
+                                          <div id="cf-helper-guide" class="hidden mt-3 p-4 bg-slate-50/50 dark:bg-slate-900/30 border border-slate-200 dark:border-darkborder rounded-2xl text-[11px] space-y-4 text-start leading-relaxed">
+                                              <div class="space-y-1 pb-3 border-b border-dashed border-slate-200 dark:border-darkborder">
+                                                  <h5 class="font-extrabold text-slate-800 dark:text-slate-200 flex items-center gap-1">🇬🇧 Beginner's Walkthrough:</h5>
+                                                  <ol class="list-decimal list-inside space-y-1 text-slate-500 dark:text-slate-400">
+                                                      <li><strong>CF API Token:</strong> Click <a href="https://dash.cloudflare.com/profile/api-tokens?template=edit-workers" target="_blank" class="text-primary hover:underline font-bold">Api Token Template ↗</a>. Click <strong>Use Template</strong>, then <strong>Continue to summary</strong> &gt; <strong>Create Token</strong>. Copy and paste above!</li>
+                                                      <li><strong>CF Account ID:</strong> Open any Cloudflare Workers page. Copy the 32-char string after <code>dash.cloudflare.com/</code> in the URL.</li>
+                                                      <li><strong>Worker Script Name:</strong> Go to <strong>Compute &gt; Workers & Pages</strong> in Cloudflare. Copy your worker's name.</li>
+                                                  </ol>
+                                              </div>
+                                          </div>
+                                      </div>
+                                  </div>
+                              </div>
+                          </div>
+
                       </div>
                       
                           <!-- USERS VIEW -->
-                      <div id="view-users" class="hidden space-y-6">
-                          <!-- Stats Grid -->
-                          <div class="grid grid-cols-1 md:grid-cols-4 gap-6">
-                              <div class="bg-white dark:bg-darkcard rounded-3xl p-5 shadow-sm border border-slate-200 dark:border-darkborder relative overflow-hidden flex items-center justify-between">
-                                  <div>
-                                      <span class="text-[10px] font-bold text-slate-400 uppercase tracking-wider block" data-i18n="stat_total_subscribers">Total Subscribers</span>
-                                      <span id="stat-total-users" class="text-2xl font-black text-slate-800 dark:text-white mt-1 block">0</span>
-                                  </div>
-                                  <div class="p-3 bg-primary/10 text-primary rounded-xl">
-                                      <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.733.153-1.431.428-2.067m1.522-2H9m3-2c1.657 0 3-1.343 3-3S13.657 3 12 3s-3 1.343-3 3 1.343 3 3 3zm1.522 5.067A12.02 12.02 0 0012 13c-1.34 0-2.618.219-3.811.62-.275.636-.428 1.334-.428 2.067v2h10v-2c0-.733-.153-1.431-.428-2.067z"></path></svg>
-                                  </div>
+                      <div id="view-users" class="hidden space-y-4">
+                          <!-- Compact Stats Bar -->
+                          <div class="bg-white dark:bg-darkcard rounded-2xl border border-slate-200 dark:border-darkborder p-4 flex flex-wrap items-center gap-4 md:gap-6">
+                              <div class="flex items-center gap-2">
+                                  <div class="p-1.5 bg-primary/10 text-primary rounded-lg"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a4 4 0 11-8 0 4 4 0 018 0z"></path></svg></div>
+                                  <div><span class="text-[10px] font-bold text-slate-400 uppercase" data-i18n="stat_total_subscribers">Total</span><span id="stat-total-users" class="ms-1.5 text-sm font-black text-slate-800 dark:text-white">0</span></div>
                               </div>
-                              <div class="bg-white dark:bg-darkcard rounded-3xl p-5 shadow-sm border border-slate-200 dark:border-darkborder relative overflow-hidden flex items-center justify-between">
-                                  <div>
-                                      <span class="text-[10px] font-bold text-slate-400 uppercase tracking-wider block" data-i18n="stat_active_paused">Active / Paused</span>
-                                      <span id="stat-active-users" class="text-2xl font-black text-slate-800 dark:text-white mt-1 block">0 / 0</span>
-                                  </div>
-                                  <div class="p-3 bg-emerald-500/10 text-emerald-500 rounded-xl">
-                                      <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
-                                  </div>
+                              <div class="flex items-center gap-2">
+                                  <div class="p-1.5 bg-emerald-500/10 text-emerald-500 rounded-lg"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg></div>
+                                  <div><span class="text-[10px] font-bold text-slate-400 uppercase" data-i18n="stat_active_paused">Active/Paused</span><span id="stat-active-users" class="ms-1.5 text-sm font-black text-slate-800 dark:text-white">0 / 0</span></div>
                               </div>
-                              <div class="bg-white dark:bg-darkcard rounded-3xl p-5 shadow-sm border border-slate-200 dark:border-darkborder relative overflow-hidden flex items-center justify-between">
-                                  <div>
-                                      <span class="text-[10px] font-bold text-slate-400 uppercase tracking-wider block" data-i18n="stat_cumulative_traffic">Cumulative Traffic</span>
-                                      <span id="stat-total-traffic" class="text-2xl font-black text-slate-800 dark:text-white mt-1 block">0 GB</span>
-                                  </div>
-                                  <div class="p-3 bg-violet-500/10 text-violet-500 rounded-xl">
-                                      <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
-                                  </div>
+                              <div class="flex items-center gap-2">
+                                  <div class="p-1.5 bg-violet-500/10 text-violet-500 rounded-lg"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg></div>
+                                  <div><span class="text-[10px] font-bold text-slate-400 uppercase" data-i18n="stat_cumulative_traffic">Traffic</span><span id="stat-total-traffic" class="ms-1.5 text-sm font-black text-slate-800 dark:text-white">0 GB</span></div>
                               </div>
-                              <div class="bg-white dark:bg-darkcard rounded-3xl p-5 shadow-sm border border-slate-200 dark:border-darkborder relative overflow-hidden flex items-center justify-between">
-                                  <div>
-                                      <span class="text-[10px] font-bold text-slate-400 uppercase tracking-wider block" data-i18n="stat_auto_disabled">Auto-Disabled</span>
-                                      <span id="stat-auto-disabled" class="text-2xl font-black text-slate-800 dark:text-white mt-1 block">0</span>
-                                  </div>
-                                  <div class="p-3 bg-red-500/10 text-red-500 rounded-xl">
-                                      <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z"></path></svg>
-                                  </div>
+                              <div class="flex items-center gap-2">
+                                  <div class="p-1.5 bg-red-500/10 text-red-500 rounded-lg"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z"></path></svg></div>
+                                  <div><span class="text-[10px] font-bold text-slate-400 uppercase" data-i18n="stat_auto_disabled">Disabled</span><span id="stat-auto-disabled" class="ms-1.5 text-sm font-black text-slate-800 dark:text-white">0</span></div>
                               </div>
                           </div>
 
@@ -4444,73 +6012,119 @@ function getDashboardUI(hasDB) {
                                           <option value="auto-disabled" data-i18n="filter_auto_disabled">Auto-Disabled</option>
                                       </select>
                                       <input type="text" id="user-search-input" onkeyup="renderUsersTable()" placeholder="🔍 Find by Name or UUID..." data-i18n="user_search_placeholder" class="bg-slate-50 dark:bg-darkbg border border-slate-200 dark:border-darkborder px-4 py-2.5 rounded-xl text-xs outline-none font-sans text-slate-600 dark:text-slate-400 focus:border-primary">
-                                      <button onclick="document.getElementById('modal-add-user').classList.remove('hidden'); buildPortCheckboxes('add-user-ports-wrap', null); buildModeCheckboxes('add-user-mode-wrap', null);" class="px-4 py-2.5 bg-primary hover:bg-primary/90 text-white rounded-xl text-xs font-bold transition-colors shadow-sm" data-i18n="btn_add_user">+ Add New User</button>
+                                      <button onclick="openAddUserModal()" class="px-4 py-2.5 bg-primary hover:bg-primary/90 text-white rounded-xl text-xs font-bold transition-colors shadow-sm" data-i18n="btn_add_user">+ Add New User</button>
                                   </div>
                               </div>
                               <div class="overflow-x-auto">
-                                  <table class="w-full text-sm text-left">
-                                      <thead class="text-xs text-slate-400 uppercase bg-slate-50/50 dark:bg-slate-800/30">
-                                          <tr>
-                                              <th class="px-4 py-3 rounded-s-xl" data-i18n="tbl_name">Name</th>
-                                              <th class="px-4 py-3" data-i18n="tbl_uuid">UUID</th>
-                                              <th class="px-4 py-3" data-i18n="tbl_traffic">Traffic (Used / Limit)</th>
-                                              <th class="px-4 py-3" data-i18n="tbl_exp">Expiration</th>
-                                              <th class="px-4 py-3 rounded-e-xl text-end" data-i18n="tbl_action">Action</th>
-                                          </tr>
-                                      </thead>
-                                      <tbody id="tbl-users" class="divide-y divide-slate-100 dark:divide-darkborder/50">
-                                      </tbody>
-                                  </table>
+                                  <div id="tbl-users" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+                                  </div>
                               </div>
                           </div>
                       </div>
 
                       <!-- Modal: Add User -->
                       <div id="modal-add-user" class="hidden fixed inset-0 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4 bg-slate-900/50 backdrop-blur-sm">
-                          <div class="bg-white dark:bg-darkcard rounded-t-3xl sm:rounded-3xl w-full sm:max-w-md max-h-[90vh] flex flex-col shadow-2xl border border-slate-200 dark:border-darkborder">
+                          <div class="bg-white dark:bg-darkcard rounded-t-3xl sm:rounded-3xl w-full sm:max-w-md max-h-[90vh] sm:max-h-[85vh] flex flex-col shadow-2xl border border-slate-200 dark:border-darkborder">
                               <div class="px-6 pt-6 pb-4 shrink-0">
                                   <h3 class="text-xl font-bold" data-i18n="modal_add_title">Add User</h3>
                               </div>
                               <div class="overflow-y-auto flex-1 min-h-0 px-6 pb-4">
-                                  <div class="space-y-4">
-                                      <div>
-                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_name">Name / Identifier</label>
-                                          <input type="text" id="add-user-name" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
-                                      </div>
-                                      <div>
-                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="limit_total">Traffic (GB) Limit (Leave empty for unlimited)</label>
-                                          <input type="number" id="add-user-total-reqs" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
-                                      </div>
-                                      <div>
-                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="limit_daily">Daily Requests Limit (Leave empty for unlimited)</label>
-                                          <input type="number" id="add-user-daily-reqs" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
-                                      </div>
-                                      <div>
-                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="limit_days">Expiration limit (Days) - Leave empty for unlimited</label>
-                                          <input type="number" id="add-user-days" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
-                                      </div>
-                                      <div>
-                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_ipproxy">User Proxy IP(s) (Optional - overrides global Clean IP, comma/newline separated)</label>
-                                          <input type="text" id="add-user-proxy-ip" placeholder="e.g. 104.20.0.1, proxyip.com" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                      </div>
-                                      <div>
-                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_Protocol">Protocol Mode</label>
-                                          <div id="add-user-mode-wrap" class="flex gap-3 mt-1">
-                                              <label class="flex items-center gap-1.5 text-sm cursor-pointer"><input type="checkbox" value="alpha" class="add-mode-cb accent-primary"> <span>Alpha (VLESS)</span></label>
-                                              <label class="flex items-center gap-1.5 text-sm cursor-pointer"><input type="checkbox" value="beta" class="add-mode-cb accent-primary"> <span>Beta (Trojan)</span></label>
+                                  <div class="space-y-3">
+                                      <details open class="group">
+                                          <summary class="flex items-center gap-2 cursor-pointer text-xs font-bold text-slate-500 uppercase tracking-wider mb-2 select-none list-none">
+                                              <svg class="w-3 h-3 transform transition-transform group-open:rotate-90" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"></path></svg>
+                                              <span data-i18n="section_basic_info">Basic Info</span>
+                                          </summary>
+                                          <div class="space-y-3 ps-5">
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_name">Name / Identifier</label>
+                                                  <input type="text" id="add-user-name" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
+                                              </div>
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_custom_config_name">Custom Config Name / Prefix</label>
+                                                  <input type="text" id="add-user-custom-name" placeholder="Leave empty to use user name" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
+                                              </div>
                                           </div>
-                                      </div>
-                                      <div>
-                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_ports">Ports</label>
-                                          <div id="add-user-ports-wrap" class="flex flex-wrap gap-2 mt-1"></div>
-                                      </div>
-                                      <div>
-                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_max_config">Max Configs (Optional - limit total generated configs, e.g. 4)</label>
-                                          <input type="number" id="add-user-max-configs" placeholder="Leave empty for unlimited" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                      </div>
+                                      </details>
+                                      <details open class="group">
+                                          <summary class="flex items-center gap-2 cursor-pointer text-xs font-bold text-slate-500 uppercase tracking-wider mb-2 select-none list-none">
+                                              <svg class="w-3 h-3 transform transition-transform group-open:rotate-90" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"></path></svg>
+                                              <span data-i18n="section_limits">Limits</span>
+                                          </summary>
+                                          <div class="space-y-3 ps-5">
+                                              <div class="grid grid-cols-2 gap-3">
+                                                  <div>
+                                                      <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_traffic_limit_gb">Traffic (GB) Limit</label>
+                                                      <input type="number" id="add-user-total-reqs" placeholder="Unlimited" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
+                                                  </div>
+                                                  <div>
+                                                      <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_daily_limit_gb">Daily Limit (GB)</label>
+                                                      <input type="number" id="add-user-daily-reqs" placeholder="Unlimited" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
+                                                  </div>
+                                              </div>
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_expiration_days">Expiration (Days)</label>
+                                                  <input type="number" id="add-user-days" placeholder="Unlimited" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
+                                              </div>
+                                          </div>
+                                      </details>
+                                      <details class="group">
+                                          <summary class="flex items-center gap-2 cursor-pointer text-xs font-bold text-slate-500 uppercase tracking-wider mb-2 select-none list-none">
+                                              <svg class="w-3 h-3 transform transition-transform group-open:rotate-90" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"></path></svg>
+                                              <span data-i18n="section_network">Network</span>
+                                          </summary>
+                                          <div class="space-y-3 ps-5">
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_clean_ips">Clean IPs</label>
+                                                  <div id="add-user-clean-ips-wrap" class="flex flex-wrap gap-2 mt-1 text-slate-500"></div>
+                                                  <label class="block text-[10px] font-bold text-slate-400 mt-2" data-i18n="desc_clean_ips_modal">Custom Clean IPs (comma/newline)</label>
+                                                  <textarea id="add-user-custom-clean" rows="1" placeholder="e.g. 1.2.3.4, 5.6.7.8" class="w-full mt-1 px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm"></textarea>
+                                              </div>
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_proxy_ips">Proxy IPs</label>
+                                                  <div id="add-user-proxy-ips-wrap" class="flex flex-wrap gap-2 mt-1 text-slate-500"></div>
+                                                  <label class="block text-[10px] font-bold text-slate-400 mt-2" data-i18n="desc_proxy_ips">Custom Proxy IPs (comma/newline)</label>
+                                                  <textarea id="add-user-custom-proxy" rows="1" placeholder="e.g. proxy1.com:443" class="w-full mt-1 px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm"></textarea>
+                                              </div>
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_assigned_nodes">Assigned Nodes</label>
+                                                  <div id="add-user-nodes-wrap" class="flex flex-wrap gap-2 mt-1 text-slate-500"></div>
+                                                  <label class="block text-[10px] font-bold text-slate-400 mt-2" data-i18n="desc_assigned_nodes">Custom Nodes (comma/newline, empty = all nodes)</label>
+                                                  <textarea id="add-user-custom-nodes" rows="1" placeholder="node1.example.com" class="w-full mt-1 px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm"></textarea>
+                                              </div>
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_nat64">NAT64 Prefix</label>
+                                                  <input type="text" id="add-user-nat64" placeholder="e.g. 64:ff9b::/96" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm font-mono">
+                                                  <p class="text-[10px] text-slate-400 mt-1" data-i18n="desc_nat64_user">Optional. Converts IPv4 Proxy IPs to NAT64 IPv6 addresses.</p>
+                                              </div>
+                                          </div>
+                                      </details>
+                                      <details class="group">
+                                          <summary class="flex items-center gap-2 cursor-pointer text-xs font-bold text-slate-500 uppercase tracking-wider mb-2 select-none list-none">
+                                              <svg class="w-3 h-3 transform transition-transform group-open:rotate-90" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"></path></svg>
+                                              <span data-i18n="section_advanced">Advanced</span>
+                                          </summary>
+                                          <div class="space-y-3 ps-5">
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_protocol_mode">Protocol Mode</label>
+                                                  <div id="add-user-mode-wrap" class="flex gap-3 mt-1">
+                                                      <label class="flex items-center gap-1.5 text-sm cursor-pointer"><input type="checkbox" value="alpha" class="add-mode-cb accent-primary"> <span>Alpha (VLESS)</span></label>
+                                                      <label class="flex items-center gap-1.5 text-sm cursor-pointer"><input type="checkbox" value="beta" class="add-mode-cb accent-primary"> <span>Beta (Trojan)</span></label>
+                                                  </div>
+                                              </div>
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1">Ports</label>
+                                                  <div id="add-user-ports-wrap" class="flex flex-wrap gap-2 mt-1"></div>
+                                              </div>
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_max_configs">Max Configs</label>
+                                                  <input type="number" id="add-user-max-configs" placeholder="Unlimited" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm" data-i18n-placeholder="unlimited">
+                                              </div>
+                                          </div>
+                                      </details>
                                   </div>
                               </div>
-                              <div class="px-6 py-4 shrink-0 border-t border-slate-200 dark:border-darkborder bg-white dark:bg-darkcard rounded-b-3xl">
+                              <div class="px-6 py-4 shrink-0 border-t border-slate-200 dark:border-darkborder bg-white dark:bg-darkcard sm:rounded-b-3xl pb-[env(safe-area-inset-bottom)]">
                                   <div class="flex justify-end gap-2">
                                       <button onclick="document.getElementById('modal-add-user').classList.add('hidden')" class="px-4 py-2 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 font-bold" data-i18n="btn_cancel">Cancel</button>
                                       <button onclick="commitAddUser()" class="px-4 py-2 rounded-xl bg-primary text-white font-bold" data-i18n="save_btn_user">Save User</button>
@@ -4521,51 +6135,108 @@ function getDashboardUI(hasDB) {
 
                       <!-- Modal: Edit User -->
                       <div id="modal-edit-user" class="hidden fixed inset-0 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4 bg-slate-900/50 backdrop-blur-sm">
-                          <div class="bg-white dark:bg-darkcard rounded-t-3xl sm:rounded-3xl w-full sm:max-w-md max-h-[90vh] flex flex-col shadow-2xl border border-slate-200 dark:border-darkborder">
+                          <div class="bg-white dark:bg-darkcard rounded-t-3xl sm:rounded-3xl w-full sm:max-w-md max-h-[90vh] sm:max-h-[85vh] flex flex-col shadow-2xl border border-slate-200 dark:border-darkborder">
                               <div class="px-6 pt-6 pb-4 shrink-0">
                                   <h3 class="text-xl font-bold" data-i18n="edit_sub">Edit Subscriber</h3>
                                   <input type="hidden" id="edit-user-id">
                               </div>
                               <div class="overflow-y-auto flex-1 min-h-0 px-6 pb-4">
-                                  <div class="space-y-4">
-                                      <div>
-                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_name_ph">Name / Identifier</label>
-                                          <input type="text" id="edit-user-name" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
-                                      </div>
-                                      <div>
-                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="limit_total">Total Requests Limit (Leave empty for unlimited)</label>
-                                          <input type="number" id="edit-user-total-reqs" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
-                                      </div>
-                                      <div>
-                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="limit_daily">Daily Requests Limit (Leave empty for unlimited)</label>
-                                          <input type="number" id="edit-user-daily-reqs" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
-                                      </div>
-                                      <div>
-                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="limit_days">Expiration limit (Days remaining) - Leave empty for unlimited</label>
-                                          <input type="number" id="edit-user-days" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
-                                      </div>
-                                      <div>
-                                          <label class="block text-xs font-bold text-slate-500 mb-1">User Proxy IP(s) (Optional - overrides global Clean IP, comma/newline separated)</label>
-                                          <input type="text" id="edit-user-proxy-ip" placeholder="e.g. 104.20.0.1, proxyip.com" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                      </div>
-                                      <div>
-                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_Protocol">Protocol Mode</label>
-                                          <div id="edit-user-mode-wrap" class="flex gap-3 mt-1">
-                                              <label class="flex items-center gap-1.5 text-sm cursor-pointer"><input type="checkbox" value="alpha" class="edit-mode-cb accent-primary"> <span>Alpha (VLESS)</span></label>
-                                              <label class="flex items-center gap-1.5 text-sm cursor-pointer"><input type="checkbox" value="beta" class="edit-mode-cb accent-primary"> <span>Beta (Trojan)</span></label>
+                                  <div class="space-y-3">
+                                      <details open class="group">
+                                          <summary class="flex items-center gap-2 cursor-pointer text-xs font-bold text-slate-500 uppercase tracking-wider mb-2 select-none list-none">
+                                              <svg class="w-3 h-3 transform transition-transform group-open:rotate-90" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"></path></svg>
+                                              <span data-i18n="section_basic_info">Basic Info</span>
+                                          </summary>
+                                          <div class="space-y-3 ps-5">
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_name_ph">Name / Identifier</label>
+                                                  <input type="text" id="edit-user-name" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
+                                              </div>
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_custom_config_name">Custom Config Name / Prefix</label>
+                                                  <input type="text" id="edit-user-custom-name" placeholder="Leave empty to use user name" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
+                                              </div>
                                           </div>
-                                      </div>
-                                      <div>
-                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_ports">Ports</label>
-                                          <div id="edit-user-ports-wrap" class="flex flex-wrap gap-2 mt-1"></div>
-                                      </div>
-                                      <div>
-                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_max_config">Max Configs (Optional - limit total generated configs, e.g. 4)</label>
-                                          <input type="number" id="edit-user-max-configs" placeholder="Leave empty for unlimited" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                      </div>
+                                      </details>
+                                      <details open class="group">
+                                          <summary class="flex items-center gap-2 cursor-pointer text-xs font-bold text-slate-500 uppercase tracking-wider mb-2 select-none list-none">
+                                              <svg class="w-3 h-3 transform transition-transform group-open:rotate-90" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"></path></svg>
+                                              <span data-i18n="section_limits">Limits</span>
+                                          </summary>
+                                          <div class="space-y-3 ps-5">
+                                              <div class="grid grid-cols-2 gap-3">
+                                                  <div>
+                                                      <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_traffic_limit_gb">Traffic Limit (GB)</label>
+                                                      <input type="number" id="edit-user-total-reqs" placeholder="Unlimited" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
+                                                  </div>
+                                                  <div>
+                                                      <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_daily_limit_gb">Daily Limit (GB)</label>
+                                                      <input type="number" id="edit-user-daily-reqs" placeholder="Unlimited" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
+                                                  </div>
+                                              </div>
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_expiration_days">Expiration (Days)</label>
+                                                  <input type="number" id="edit-user-days" placeholder="Unlimited" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
+                                              </div>
+                                          </div>
+                                      </details>
+                                      <details class="group">
+                                          <summary class="flex items-center gap-2 cursor-pointer text-xs font-bold text-slate-500 uppercase tracking-wider mb-2 select-none list-none">
+                                              <svg class="w-3 h-3 transform transition-transform group-open:rotate-90" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"></path></svg>
+                                              <span data-i18n="section_network">Network</span>
+                                          </summary>
+                                          <div class="space-y-3 ps-5">
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_clean_ips">Clean IPs</label>
+                                                  <div id="edit-user-clean-ips-wrap" class="flex flex-wrap gap-2 mt-1 text-slate-500"></div>
+                                                  <label class="block text-[10px] font-bold text-slate-400 mt-2" data-i18n="desc_clean_ips_modal">Custom Clean IPs (comma/newline)</label>
+                                                  <textarea id="edit-user-custom-clean" rows="1" placeholder="e.g. 1.2.3.4, 5.6.7.8" class="w-full mt-1 px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm"></textarea>
+                                              </div>
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_proxy_ips">Proxy IPs</label>
+                                                  <div id="edit-user-proxy-ips-wrap" class="flex flex-wrap gap-2 mt-1 text-slate-500"></div>
+                                                  <label class="block text-[10px] font-bold text-slate-400 mt-2" data-i18n="desc_proxy_ips">Custom Proxy IPs (comma/newline)</label>
+                                                  <textarea id="edit-user-custom-proxy" rows="1" placeholder="e.g. proxy1.com:443" class="w-full mt-1 px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm"></textarea>
+                                              </div>
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_assigned_nodes">Assigned Nodes</label>
+                                                  <div id="edit-user-nodes-wrap" class="flex flex-wrap gap-2 mt-1 text-slate-500"></div>
+                                                  <label class="block text-[10px] font-bold text-slate-400 mt-2" data-i18n="desc_assigned_nodes">Custom Nodes (comma/newline, empty = all nodes)</label>
+                                                  <textarea id="edit-user-custom-nodes" rows="1" placeholder="node1.example.com" class="w-full mt-1 px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm"></textarea>
+                                              </div>
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_nat64">NAT64 Prefix</label>
+                                                  <input type="text" id="edit-user-nat64" placeholder="e.g. 64:ff9b::/96" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm font-mono">
+                                                  <p class="text-[10px] text-slate-400 mt-1" data-i18n="desc_nat64_user">Optional. Converts IPv4 Proxy IPs to NAT64 IPv6 addresses.</p>
+                                              </div>
+                                          </div>
+                                      </details>
+                                      <details class="group">
+                                          <summary class="flex items-center gap-2 cursor-pointer text-xs font-bold text-slate-500 uppercase tracking-wider mb-2 select-none list-none">
+                                              <svg class="w-3 h-3 transform transition-transform group-open:rotate-90" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"></path></svg>
+                                              <span data-i18n="section_advanced">Advanced</span>
+                                          </summary>
+                                          <div class="space-y-3 ps-5">
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_protocol_mode">Protocol Mode</label>
+                                                  <div id="edit-user-mode-wrap" class="flex gap-3 mt-1">
+                                                      <label class="flex items-center gap-1.5 text-sm cursor-pointer"><input type="checkbox" value="alpha" class="edit-mode-cb accent-primary"> <span>Alpha (VLESS)</span></label>
+                                                      <label class="flex items-center gap-1.5 text-sm cursor-pointer"><input type="checkbox" value="beta" class="edit-mode-cb accent-primary"> <span>Beta (Trojan)</span></label>
+                                                  </div>
+                                              </div>
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1">Ports</label>
+                                                  <div id="edit-user-ports-wrap" class="flex flex-wrap gap-2 mt-1"></div>
+                                              </div>
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_max_configs">Max Configs</label>
+                                                  <input type="number" id="edit-user-max-configs" placeholder="Unlimited" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm" data-i18n-placeholder="unlimited">
+                                              </div>
+                                          </div>
+                                      </details>
                                   </div>
                               </div>
-                              <div class="px-6 py-4 shrink-0 border-t border-slate-200 dark:border-darkborder bg-white dark:bg-darkcard rounded-b-3xl">
+                              <div class="px-6 py-4 shrink-0 border-t border-slate-200 dark:border-darkborder bg-white dark:bg-darkcard sm:rounded-b-3xl pb-[env(safe-area-inset-bottom)]">
                                   <div class="flex justify-end gap-2">
                                       <button onclick="document.getElementById('modal-edit-user').classList.add('hidden')" class="px-4 py-2 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 font-bold" data-i18n="btn_cancel">Cancel</button>
                                       <button onclick="commitEditUser()" class="px-4 py-2 rounded-xl bg-primary text-white font-bold" data-i18n="btn_save_changes">Save Changes</button>
@@ -4578,13 +6249,13 @@ function getDashboardUI(hasDB) {
                       <div id="view-logs" class="hidden space-y-6">
                           <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder relative overflow-hidden">
                               <div class="flex items-center justify-between mb-6">
-                                  <h3 class="text-sm uppercase font-bold text-slate-500 tracking-wider">System Activity Logs</h3>
+                                  <h3 class="text-sm uppercase font-bold text-slate-500 tracking-wider" data-i18n="tab_logs">System Activity Logs</h3>
                                   <button onclick="loadLogs()" class="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 rounded-lg text-xs font-bold transition-colors">
                                       🔄 Refresh
                                   </button>
                               </div>
                               <div class="space-y-3" id="logs-container">
-                                  <p class="text-sm text-slate-400 text-center py-8">Loading activity logs...</p>
+                                  <p class="text-sm text-slate-400 text-center py-8" data-i18n="loading_logs">Loading activity logs...</p>
                               </div>
                           </div>
                       </div>
@@ -4643,8 +6314,8 @@ function getDashboardUI(hasDB) {
                   <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
               </button>
               <div class="text-center mb-6">
-                  <h3 id="qr-modal-title" class="text-xl font-bold text-slate-800 dark:text-white">Scan to Connect</h3>
-                  <p class="text-xs text-slate-500 mt-1">Scan with your V-Core or T-Core client</p>
+                  <h3 id="qr-modal-title" class="text-xl font-bold text-slate-800 dark:text-white" data-i18n="qr_title">Scan to Connect</h3>
+                  <p class="text-xs text-slate-500 mt-1" data-i18n="qr_subtitle">Scan with your V-Core or T-Core client</p>
               </div>
               <div class="bg-white p-4 rounded-2xl shadow-inner border border-slate-100 mb-4">
                   <img id="qr-modal-img" src="" alt="QR Code" class="w-full aspect-square object-contain">
@@ -4693,6 +6364,99 @@ function getDashboardUI(hasDB) {
       </div>
   
       <script>
+          function parseImportBindings(importStr) {
+              const cleanStr = importStr.replace(/\\/\\/.*$/gm, '').replace(/\\/\\*[\\s\\S]*?\\*\\//g, '').trim();
+              const content = cleanStr
+                  .replace(/^import\\s+/, '')
+                  .replace(/\\s+from\\s+["'].*?["'];?$/, '')
+                  .trim();
+              
+              const bindings = [];
+              
+              if (content.startsWith('*')) {
+                  const match = content.match(/\\*\\s+as\\s+(\\w+)/);
+                  if (match) bindings.push({ name: match[1], isNamespace: true });
+                  return bindings;
+              }
+              
+              const braceStart = content.indexOf('{');
+              if (braceStart !== -1) {
+                  const defaultPart = content.slice(0, braceStart).replace(/,/, '').trim();
+                  if (defaultPart) {
+                      bindings.push({ name: defaultPart, isDefault: true });
+                  }
+                  const bracePart = content.slice(braceStart + 1, content.lastIndexOf('}')).trim();
+                  const namedImports = bracePart.split(',').map(s => s.trim()).filter(Boolean);
+                  namedImports.forEach(item => {
+                      if (item.includes(' as ')) {
+                          const parts = item.split(/\\s+as\\s+/);
+                           bindings.push({ name: parts[1], original: parts[0] });
+                      } else {
+                          bindings.push({ name: item });
+                      }
+                  });
+              } else {
+                  bindings.push({ name: content, isDefault: true });
+              }
+              
+              return bindings;
+          }
+
+          function obfuscateCode(srcText) {
+              const importRegex = /import\\s+[\\s\\S]*?from\\s+["'].*?["'];?/g;
+              const imports = [];
+              let match;
+              
+              while ((match = importRegex.exec(srcText)) !== null) {
+                  imports.push(match[0]);
+              }
+              
+              let cleanCode = srcText.replace(importRegex, '');
+              
+              const bindings = [];
+              imports.forEach(imp => {
+                  const parsed = parseImportBindings(imp);
+                  bindings.push(...parsed);
+              });
+              
+              const uniqueBindings = [];
+              const seenNames = new Set();
+              bindings.forEach(b => {
+                  if (!seenNames.has(b.name)) {
+                      seenNames.add(b.name);
+                      uniqueBindings.push(b);
+                  }
+              });
+              
+              cleanCode = cleanCode.replace(/export\\s+default\\s+/g, 'const _0xNahanModule = ');
+              cleanCode += '\\nreturn _0xNahanModule;';
+              
+              const randKey = Math.floor(Math.random() * 80) + 64; 
+              
+              const encoder = new TextEncoder();
+              const bytes = encoder.encode(cleanCode);
+              
+              let hexOutput = '';
+              for (let i = 0; i < bytes.length; i++) {
+                  const xorByte = bytes[i] ^ randKey;
+                  hexOutput += xorByte.toString(16).padStart(2, '0');
+               }
+              
+              const rawImportsStr = imports.join('\\n');
+              const bindingNames = uniqueBindings.map(b => b.name);
+              
+              const finalLoaderCode = rawImportsStr + '\\n\\n' +
+                  '// Nahan Gateway - Obfuscated Loader Context (v2.5.4.2 Optimized)\\n' +
+                  'const _0xNahanPayload = "' + hexOutput + '";\\n' +
+                  'const _0xNahanKey = ' + randKey + ';\\n\\n' +
+                  'const _0xNahanBytes = new Uint8Array((_0xNahanPayload.match(/.{1,2}/g) || []).map(x => parseInt(x, 16) ^ _0xNahanKey));\\n' +
+                  'const _0xNahanCode = new TextDecoder().decode(_0xNahanBytes);\\n' +
+                  'const _0xNahanRuntime = new Function(' + bindingNames.map(name => '"' + name + '"').join(', ') + ', _0xNahanCode)(' + bindingNames.join(', ') + ');\\n\\n' +
+                  'export default _0xNahanRuntime;';
+
+              return finalLoaderCode;
+          }
+
           const CURRENT_VERSION = "${CURRENT_VERSION}";
           const i18n = {
               en: {
@@ -4703,7 +6467,8 @@ function getDashboardUI(hasDB) {
                   lbl_proto: "Primary Display Mode", lbl_port: "Data Port", lbl_id: "Device UUID (Empty=Auto)",
                   lbl_path: "API Route (Hidden Path)", lbl_pass: "Master Key", lbl_fp: "TLS Signature", lbl_dns: "Resolver IP",
                   lbl_clean_ips: "Clean IPs (Multi-Generator)", ph_clean_ips: "1.1.1.1, 2.2.2.2", desc_clean_ips: "Separate IPs by comma or new line. The Sync URL will multiply configs for all IPs.",
-                  lbl_fake: "Maintenance Hosts (Camouflage)", lbl_relay: "Backup Relay IP", lbl_tfo: "TCP Fast Open", lbl_ech: "Secure Hello (ECH)",                   lbl_tg_token: "Telegram Bot Token", lbl_tg_chat: "Telegram Chat ID", lbl_tg_admin: "Authorized Telegram Admin ID", desc_tg_admin: "Only this Telegram User ID can manage the panel via bot. Leave empty to use Chat ID.", desc_tg_bot: "Set these values to receive login alerts via Telegram.",
+                  lbl_fake: "Maintenance Hosts (Camouflage)", lbl_relay: "Backup Relay IP", lbl_tfo: "TCP Fast Open", lbl_ech: "Secure Hello (ECH)",
+                  lbl_fake_configs: "Subscription Fake Entries", desc_fake_configs: "Customize info entries shown in subscription profiles. Use {usage} and {expiry} for dynamic values.", btn_add_entry: "Add Entry",                   lbl_tg_token: "Telegram Bot Token", lbl_tg_chat: "Telegram Chat ID", lbl_tg_admin: "Authorized Telegram Admin ID", desc_tg_admin: "Only this Telegram User ID can manage the panel via bot. Leave empty to use Chat ID.", desc_tg_bot: "Set these values to receive login alerts via Telegram.",
                   lbl_cf_acc: "Cloudflare Account ID", lbl_cf_token: "Cloudflare API Token", desc_cf_api: "Optional: Monitor Worker daily usage limit (100k/day). Requires Account Analytics read permission.",
                   lbl_silent: "Silent UI Alerts", lbl_pause: "Kill Switch (Pause System)",
                   lbl_sub_ua: "Custom Subscription User-Agent", desc_sub_ua: "Allow specific browser User-Agent containing this text to bypass camouflage and retrieve profile data directly in web browser.",
@@ -4713,7 +6478,7 @@ function getDashboardUI(hasDB) {
                   modal_add_title: "Add New User", lbl_u_name: "Name (Required)", lbl_u_gb: "Traffic Limit (GB) - Optional", lbl_u_days: "Duration (Days) - Optional", btn_cancel: "Cancel", btn_confirm: "Add User",
                   limit_total: "Traffic (GB) Limit (Leave empty for unlimited)", limit_daily: "Daily Requests Limit (Leave empty for unlimited)",
                   limit_days: "Expiration limit (Days) - Leave empty for unlimited", edit_sub: "Edit Subscriber", lbl_name_ph: "Name or UUID",
-                  btn_save_changes: "Save Changes", save_btn_user: "Save User", status_active: "Active", status_paused: "Paused", status_expired: "Expired",
+                  btn_save_changes: "Save Changes", save_btn_user: "Save User", save_btn: "Save Config", status_active: "Active", status_paused: "Paused", status_expired: "Expired",
                   stat_total_subscribers: "Total Subscribers", stat_active_paused: "Active / Paused", stat_cumulative_traffic: "Cumulative Traffic", stat_auto_disabled: "Auto-Disabled",
                   sub_directory_title: "Subscriber Directory", sub_directory_desc: "Search, modify bounds, toggle traffic limits or clear billing sessions.", user_search_placeholder: "🔍 Find by Name or UUID...",
                   filter_all: "All Users", filter_active: "Active", filter_paused: "Paused", filter_auto_disabled: "Auto-Disabled",
@@ -4733,7 +6498,47 @@ function getDashboardUI(hasDB) {
                   ov_system: "System", ov_recent_activity: "Recent Activity", ov_view_all: "View All →", ov_loading: "Loading...",
                    ov_quick_actions: "Quick Actions", ov_add_user: "Add User", ov_backup_config: "Backup Config", ov_refresh: "Refresh Statistics", ov_manage_users: "Manage Users",
                    ov_gb_unit: "GB",
-              },
+                   lbl_allow_sync:"Allow Sync",
+                   deploy_btn: "Deploy Now", update_deploying: "Deploying update...",
+                   update_success: "Update successful! Reloading...", update_error: "Update failed",
+                   lbl_cf_worker: "CF Worker Script Name", desc_cf_worker: "Required for in-panel updates. The script name shown in your Cloudflare Workers dashboard.",
+                   view_github: "View on GitHub",
+                    cf_help_title: "Need help getting these? Beginner's Step-by-Step Guide",
+                    lbl_update_format: "Update Format & Obfuscated Options:",
+                    desc_update_format: "Deploy clean source code, or encrypt using dynamic XOR byte-shifting to avoid network interception.",
+                    format_normal: "Normal (_worker.js)",
+                    format_obfuscated: "Obfuscated (UTF-8 + XOR)",
+                     btn_redeploy_force: "Force Redeploy / Switch Format",
+                    adv_network_dns: "Network & DNS", adv_proxy_relay: "Proxy & Relay", adv_subscription: "Subscription",
+                    adv_protocol: "Protocol", adv_telegram: "Telegram Bot", adv_cloudflare: "Cloudflare",
+                    stat_datetime: "Date Time",
+                    desc_custom_panel_url: "Optionally specify a custom domain/URL to be used for subscription/sync links. If empty, the default Worker address will be used.",
+                    lbl_custom_config_name: "Custom Config Name / Prefix",
+                    lbl_traffic_limit_gb: "Traffic (GB) Limit",
+                    lbl_daily_limit_gb: "Daily Limit (GB)",
+                    lbl_expiration_days: "Expiration (Days)",
+                    loading_logs: "Loading activity logs...", show_qr: "Show QR Code",
+                    no_matching_users: "No matching subscribers found", no_active_conn: "No active connection data yet.",
+                    qr_subtitle: "Scan with your V-Core or T-Core client",
+                    no_activity_logs: "No activity logs found.", no_recent_activity: "No recent activity.",
+                    no_ips_advanced: "No IPs added in Advanced Tab", no_nodes_advanced: "No slave nodes in Advanced Tab",
+                    no_changelog: "No changelog available for this version.", no_changes: "No changes documented.",
+                    update_requires_cf: "Set CF Account ID, API Token, and Worker Name to enable in-panel deploy.",
+                    section_basic_info: "Basic Info", section_limits: "Limits", section_network: "Network", section_advanced: "Advanced",
+                    lbl_nat64: "NAT64 Prefix", desc_nat64: "Optional. Converts IPv4 Proxy IPs to NAT64 IPv6 addresses. Supports multiple prefixes.",
+                    lbl_direct_configs: "Include Direct Configs", desc_direct_configs: "Generate configs without Proxy IP alongside relay configs",
+                    lbl_auto_update: "Auto-Update", desc_auto_update: "Automatically deploy when a new version is detected",
+                    lbl_auto_update_format: "Update Format", format_normal_label: "Normal", format_obfuscated_label: "Obfuscated",
+                    desc_format_normal: "Standard _worker.js", desc_format_obfuscated: "XOR byte-shifting",
+                    lbl_clean_ips: "Clean IPs", lbl_proxy_ips: "Proxy IPs", lbl_assigned_nodes: "Assigned Nodes",
+                    lbl_protocol_mode: "Protocol Mode", lbl_max_configs: "Max Configs",
+                    desc_assigned_nodes: "Custom Nodes (comma/newline, empty = all nodes)",
+                    desc_nat64_user: "Optional. Converts IPv4 Proxy IPs to NAT64 IPv6 addresses.",
+                    desc_proxy_ips: "Custom Proxy IPs (comma/newline)",
+                    desc_clean_ips_modal: "Custom Clean IPs (comma/newline)",
+                    btn_generate_uuid: "Generate UUID",
+                    html_desc_strategy: "Supported placeholders: <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{FLAG}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{COUNTRY}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{CITY}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{ISP}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{PROTOCOL}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{USER}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{PORT}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{PREFIX}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{IP}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{HOST}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{DATE}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{INDEX}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{WORKER}</code>.<br><span class='text-[10px] text-slate-400 dark:text-slate-500 leading-snug'>• <b>{FLAG}</b>: Country flag emoji (e.g. 🇺🇸).<br>• <b>{COUNTRY}</b>: Country name (e.g. United States).<br>• <b>{CITY}</b>: City name (e.g. San Francisco).<br>• <b>{ISP}</b>: ISP / ASN org (e.g. Cloudflare, Inc.).<br>• <b>{PROTOCOL}</b>: Core mode (VLESS / Trojan).<br>• <b>{USER}</b>: Subscriber name.<br>• <b>{PORT}</b>: Active port.<br>• <b>{PREFIX}</b>: Custom prefix.<br>• <b>{IP}</b>: Clean IP address.<br>• <b>{HOST}</b>: Hostname.<br>• <b>{DATE}</b>: Current date (YYYY-MM-DD).<br>• <b>{INDEX}</b>: Config index (0, 1, 2...).<br>• <b>{WORKER}</b>: Worker name from config.</span><br>Pre-defined strategies: <code>default</code>, <code>type-user-port</code>, <code>user-port</code>, <code>host-port-user</code>, <code>prefix-user-port</code>, <code>ip</code>.",
+               },
               fa: {
                   title: "دروازه نهان", pass_ph: "کلید اصلی", login_btn: "ورود به سیستم", err_pass: "دسترسی مسدود شد", missing_db: "⚠️ فضای پایگاه داده یافت نشد! تنظیمات ذخیره نمی‌شوند.",
                   logout: "خروج", tab_overview: "نمای کلی", tab_info: "نقاط اتصال", tab_status: "وضعیت شبکه", tab_settings: "تنظیمات پایه", tab_adv: "پیشرفته", tab_logs: "گزارش فعالیت",
@@ -4742,7 +6547,8 @@ function getDashboardUI(hasDB) {
                   lbl_proto: "پروتکل نمایش مستقیم", lbl_port: "پورت داده", lbl_id: "شناسه یکتا (خالی=خودکار)",
                   lbl_path: "مسیر مخفی آی‌پی‌آی", lbl_pass: "کلید اصلی", lbl_fp: "امضای امنیتی", lbl_dns: "آی‌پی تحلیلگر",
                   lbl_clean_ips: "آی‌پی‌های تمیز (مولد چندگانه)", ph_clean_ips: "1.1.1.1, 2.2.2.2", desc_clean_ips: "آی‌پی ها را با کاما یا خط جدید جدا کنید. لینک ساب برای همه ترکیب می‌سازد.",
-                  lbl_fake: "سایت‌های استتار (حالت مخفی)", lbl_relay: "آی‌پی جایگزین (کمکی)", lbl_tfo: "اتصال سریع", lbl_ech: "سلام امن", lbl_tg_token: "توکن ربات تلگرام", lbl_tg_chat: "شناسه عددی تلگرام", lbl_tg_admin: "شناسه مدیر تلگرام", desc_tg_admin: "فقط این شناسه کاربری تلگرام می‌تواند پنل را از طریق ربات مدیریت کند. خالی بگذارید برای استفاده از شناسه چت.", desc_tg_bot: "با تنظیم این مقادیر، جزئیات ورود به پنل به تلگرام ارسال می‌شود.",
+                  lbl_fake: "سایت‌های استتار (حالت مخفی)", lbl_relay: "آی‌پی جایگزین (کمکی)", lbl_tfo: "اتصال سریع", lbl_ech: "سلام امن",
+                  lbl_fake_configs: "ورودی‌های اطلاعاتی اشتراک", desc_fake_configs: "متن نمایشی ورودی‌ها در پروفایل اشتراک را سفارشی کنید. از {usage} و {expiry} برای مقادیر پویا استفاده کنید.", btn_add_entry: "افزودن ورودی", lbl_tg_token: "توکن ربات تلگرام", lbl_tg_chat: "شناسه عددی تلگرام", lbl_tg_admin: "شناسه مدیر تلگرام", desc_tg_admin: "فقط این شناسه کاربری تلگرام می‌تواند پنل را از طریق ربات مدیریت کند. خالی بگذارید برای استفاده از شناسه چت.", desc_tg_bot: "با تنظیم این مقادیر، جزئیات ورود به پنل به تلگرام ارسال می‌شود.",
                   lbl_cf_acc: "شناسه اکانت ابری", lbl_cf_token: "توکن دسترسی کاربری", desc_cf_api: "اختیاری: برای نمایش میزان مصرف روزانه کارگر از صد هزار درخواست رایگان در پیام‌های تلگرام.",
                   lbl_silent: "هشدار و پیغام خاموش", lbl_pause: "کلید توقف اضطراری",
                   lbl_sub_ua: "یوزراجنت سفارشی ساب", desc_sub_ua: "درخواست‌های مرورگر که حاوی این متن باشند، استتار را خنثی کرده و مستقیم به ساب دسترسی پیدا می‌کنند.",
@@ -4753,6 +6559,39 @@ function getDashboardUI(hasDB) {
                   save_btn: "ذخیره تنظیمات", msg_saving: "در حال ثبت...", msg_saved: "موفق! در حال بارگذاری...", msg_err: "خطای ارتباط",
                   backup_restore_title: "پشتیبان‌گیری و بازیابی", ping_test_title: "عیب‌یابی تاخیر شبکه", ping_test_desc: "تاخیر پاسخ‌دهی را به آی‌پی تمیز فعال اندازه بگیرید.",
                   lbl_github_repo: "مخزن منبع جهت بروزرسانی", update_avail: "بروزرسانی جدید در دسترس است!", update_btn: "دریافت آخرین کد",
+                    cf_help_title: "آموزش بدست آوردن این اطلاعات برای کاربران مبتدی",
+                    lbl_update_format: "قالب بروزرسانی و حذف ردگیری:",
+                    desc_update_format: "سورس کد معمولی را دپلوی کنید یا از مبهم‌سازی بایت‌ها با کلید متغیر XOR برای عدم فیلترینگ استفاده نمایید.",
+                    format_normal: "معمولی (_worker.js)",
+                    format_obfuscated: "مبهم‌سازی شده (UTF-8 + XOR)",
+                    btn_redeploy_force: "تفویض مجدد / تغییر قالب پنل",
+                    adv_network_dns: "شبکه و DNS", adv_proxy_relay: "پروکسی و رله", adv_subscription: "اشتراک",
+                    adv_protocol: "پروتکل", adv_telegram: "ربات تلگرام", adv_cloudflare: "کلودفلر",
+                    stat_datetime: "تاریخ و زمان",
+                    desc_custom_panel_url: "اختیاری. یک دامنه/آدرس سفارشی برای لینک‌های ساب/همگام‌سازی وارد کنید. اگر خالی باشد، آدرس پیش‌فرض ورکر استفاده می‌شود.",
+                    lbl_custom_config_name: "نام/پیشوند سفارشی کانفیگ",
+                    lbl_traffic_limit_gb: "محدودیت ترافیک (GB)",
+                    lbl_daily_limit_gb: "محدودیت روزانه (GB)",
+                    lbl_expiration_days: "تاریخ انقضا (روز)",
+                    loading_logs: "در حال بارگذاری گزارش‌ها...", show_qr: "نمایش کد QR",
+                    no_matching_users: "کاربری مطابقت نداشت", no_active_conn: "هنوز داده اتصال فعالی ثبت نشده.",
+                    qr_subtitle: "با کلاینت V-Core یا T-Core اسکن کنید",
+                    no_activity_logs: "گزارش فعالیتی یافت نشد.", no_recent_activity: "فعالیت اخیری ثبت نشده.",
+                    no_ips_advanced: "آی‌پی‌ای در بخش پیشرفته اضافه نشده", no_nodes_advanced: "نود فرعی‌ای در بخش پیشرفته اضافه نشده",
+                    no_changelog: "گزارش تغییراتی برای این نسخه موجود نیست.", no_changes: "تغییراتی ثبت نشده.",
+                    section_basic_info: "اطلاعات پایه", section_limits: "محدودیت‌ها", section_network: "شبکه", section_advanced: "پیشرفته",
+                    lbl_nat64: "پیشوند NAT64", desc_nat64: "اختیاری. آی‌پی‌های پروکسی IPv4 را به آدرس‌های NAT64 IPv6 تبدیل می‌کند. چند پیشوند پشتیبانی می‌شود.",
+                    lbl_direct_configs: "شامل کانفیگ‌های مستقیم", desc_direct_configs: "تولید کانفیگ‌ها بدون آی‌پی پروکسی در کنار کانفیگ‌های رله",
+                    lbl_auto_update: "بروزرسانی خودکار", desc_auto_update: "دپلوی خودکار هنگام شناسایی نسخه جدید",
+                    lbl_auto_update_format: "قالب بروزرسانی", format_normal_label: "معمولی", format_obfuscated_label: "مبهم‌سازی شده",
+                    desc_format_normal: "استاندارد _worker.js", desc_format_obfuscated: "جابجایی بایت XOR",
+                    lbl_clean_ips: "آی‌پی‌های تمیز", lbl_proxy_ips: "آی‌پی‌های پروکسی", lbl_assigned_nodes: "نودهای اختصاصی",
+                    lbl_protocol_mode: "پروتکل", lbl_max_configs: "حداکثر کانفیگ",
+                    desc_assigned_nodes: "نودهای سفارشی (کاما/خط جدید، خالی = همه نودها)",
+                    desc_nat64_user: "اختیاری. آی‌پی‌های پروکسی IPv4 را به آدرس‌های NAT64 IPv6 تبدیل می‌کند.",
+                    desc_proxy_ips: "آی‌پی‌های پروکسی سفارشی (کاما/خط جدید)",
+                    desc_clean_ips_modal: "آی‌پی‌های تمیز سفارشی (کاما/خط جدید)",
+                    btn_generate_uuid: "تولید UUID",
                   metrics_live: "وضعیت زنده مصرف اتصالات و پردازش", no_metrics: "هنوز داده‌ای از تراکنش و اتصالات فعال ثبت نشده است.", run_diagnostics: "⚡ اجرای عیب‌یابی شبکه",
                   target_node: "هدف گره شبکه", response: "مدت زمان تاخیر پاسخگویی", status: "وضعیت گره", local_port: "درگاه محلی",
                   lbl_doh: "تحلیل‌گر تخصصی آدرس‌یابی عددی", lbl_strategy: "روش نام‌گذاری کانفیگ‌ها", lbl_prefix: "پیشوند نام کانفیگ‌ها",
@@ -4779,10 +6618,140 @@ function getDashboardUI(hasDB) {
                    ov_system: "سیستم", ov_recent_activity: "فعالیت‌های اخیر", ov_view_all: "مشاهده همه ←", ov_loading: "در حال بارگذاری...",
                    ov_quick_actions: "عملیات سریع", ov_add_user: "افزودن کاربر", ov_backup_config: "پشتیبان‌گیری", ov_refresh: "بروزرسانی آمار", ov_manage_users: "مدیریت کاربران",
                    ov_gb_unit: "گیگابایت",
+                     lbl_allow_sync:"اجازه همگام سازی",
+                      deploy_btn: "هم‌اکنون نصب کن", update_deploying: "در حال نصب بروزرسانی...",
+                      update_success: "بروزرسانی موفق! در حال بارگذاری...", update_error: "خطا در بروزرسانی",
+                      lbl_cf_worker: "نام اسکریپت کارگر ابری", desc_cf_worker: "برای بروزرسانی خودکار الزامی است. نام اسکریپت در داشبورد کارگرهای ابری.",
+                      view_github: "مشاهده در گیت‌هاب",
+                     update_requires_cf: "برای نصب خودکار، شناسه اکانت، توکن API و نام کارگر را تنظیم کنید.",
+                     html_desc_strategy: "متغیرهای پشتیبانی شده: <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{FLAG}</code>، <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{COUNTRY}</code>، <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{CITY}</code>، <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{ISP}</code>، <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{PROTOCOL}</code>، <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{USER}</code>، <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{PORT}</code>، <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{PREFIX}</code>، <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{IP}</code>، <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{HOST}</code>، <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{DATE}</code>، <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{INDEX}</code>، <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{WORKER}</code>.<br><span class='text-[10px] text-slate-400 dark:text-slate-500 leading-snug'>• <b>{FLAG}</b>: ایموجی پرچم کشور (مثلاً 🇺🇸).<br>• <b>{COUNTRY}</b>: نام کشور (مثلاً United States).<br>• <b>{CITY}</b>: نام شهر (مثلاً San Francisco).<br>• <b>{ISP}</b>: نام ارائه‌دهنده اینترنت (مثلاً Cloudflare, Inc.).<br>• <b>{PROTOCOL}</b>: پروتکل اصلی هسته (VLESS / Trojan).<br>• <b>{USER}</b>: نام یا شناسه مشترک.<br>• <b>{PORT}</b>: پورت فعال اتصال.<br>• <b>{PREFIX}</b>: پیشوند نام دلخواه.<br>• <b>{IP}</b>: آدرس آی‌پی تمیز.<br>• <b>{HOST}</b>: نام دامنه هاست.<br>• <b>{DATE}</b>: تاریخ جاری (YYYY-MM-DD).<br>• <b>{INDEX}</b>: شماره ردیف کانفیگ (0, 1, 2...).<br>• <b>{WORKER}</b>: نام اسکریپت کارگر ابری.</span><br>طرح‌های از پیش تعریف شده: <code>default</code>، <code>type-user-port</code>، <code>user-port</code>، <code>host-port-user</code>، <code>prefix-user-port</code>، <code>ip</code>.",
                 }
           };
 
           const CHANGELOG_DATA = {
+              "2.6.0": {
+                  headline: { en: "Bilingual Subscription Page & NAT64 Support", fa: "صفحه اشتراک چندزبانه و پشتیبانی NAT64" },
+                  added: [
+                      { en: "Full Persian and English language support on the subscription info page with RTL layout", fa: "پشتیبانی کامل از فارسی و انگلیسی در صفحه اطلاعات اشتراک با چیدمان RTL" },
+                      { en: "Dark and light mode toggle on the subscription page with saved preference", fa: "قابلیت تغییر حالت تاریک/روشن در صفحه اشتراک با ذخیره ترجیح کاربر" },
+                      { en: "NAT64 support for automatic IPv4 to IPv6 address conversion", fa: "پشتیبانی NAT64 برای تبدیل خودکار آدرس IPv4 به IPv6" },
+                      { en: "Per-user custom hostnames for multi-region deployments", fa: "هاست‌های اختصاصی برای هر کاربر جهت استقرار چند منطقه‌ای" },
+                      { en: "Direct connection configs that work without proxy IPs", fa: "کانفیگ‌های اتصال مستقیم بدون نیاز به آدرس پروکسی" },
+                      { en: "Auto update from GitHub directly inside the dashboard", fa: "بروزرسانی خودکار از GitHub مستقیماً از داشبورد" },
+                      { en: "Customizable fake subscription entries with usage and expiry display", fa: "ورودی‌های اشتراک جعلی سفارشی با نمایش مصرف و انقضا" },
+                      { en: "Full gateway management via Telegram inline buttons", fa: "مدیریت کامل دروازه از طریق دکمه‌های اینلاین تلگرام" }
+                  ],
+                  fixed: [
+                      { en: "Fixed garbled Persian text in the user interface", fa: "اصلاح متن‌های فارسی نادرست در رابط کاربری" },
+                      { en: "Fixed subscription page not loading properly", fa: "رفع مشکل بارگذاری صفحه اشتراک" }
+                  ],
+                  improved: [
+                      { en: "Significantly faster dashboard scrolling and page loading", fa: "سرعت اسکرول و بارگذاری صفحات داشبورد بهبود چشمگیر یافت" },
+                      { en: "Rewritten config generators for better compatibility", fa: "بازنویسی مولدهای کانفیگ برای سازگاری بهتر" },
+                      { en: "Faster and more accurate country flag detection", fa: "سرعت و دقت نمایش پرچم کشورها بهبود یافت" },
+                      { en: "New config naming tags: country, city, ISP, date, and worker name", fa: "تگ‌های جدید نامگذاری: کشور، شهر، ارائه‌دهنده، تاریخ و نام ورکر" }
+                  ],
+                  notes: []
+              },
+              "2.5.8": {
+                  headline: { en: "Advanced Naming Tags & GeoIP Tag Engine", fa: "موتور نامگذاری پیشرفته با تگ‌های جغرافیایی" },
+                  added: [
+                      { en: "Added 7 new config naming placeholders: {COUNTRY}, {CITY}, {ISP}, {HOST}, {DATE}, {INDEX}, {WORKER}", fa: "اضافه شدن ۷ متغیر جدید نامگذاری: {COUNTRY}، {CITY}، {ISP}، {HOST}، {DATE}، {INDEX}، {WORKER}" },
+                      { en: "Replaced single-purpose flag API with batch ip-api.com GeoIP enrichment for country, city, and ISP data", fa: "جایگزینی API پرچم با غنی‌سازی GeoIP دسته‌ای ip-api.com برای داده‌های کشور، شهر و ارائه‌دهنده اینترنت" },
+                      { en: "Added tag validation engine that detects and reports unknown/invalid tags in naming strategies", fa: "افزودن موتور اعتبارسنجی تگ که تگ‌های ناشناخته یا نامعتبر در استراتژی نامگذاری را شناسایی و گزارش می‌کند" }
+                  ],
+                  fixed: [
+                      { en: "GeoIP cache now stores full geo metadata (country, city, ISP) instead of only flag emoji", fa: "کش GeoIP اکنون فراداده‌های کامل جغرافیایی (کشور، شهر، ارائه‌دهنده) را به جای فقط ایموجی پرچم ذخیره می‌کند" }
+                  ],
+                  improved: [
+                      { en: "Config name generation now receives config index for sequential naming patterns via {INDEX}", fa: "تولید نام کانفیگ اکنون شماره ردیف را برای الگوهای نامگذاری متوالی از طریق {INDEX} دریافت می‌کند" },
+                      { en: "Updated dashboard documentation with full list of all 13 supported naming tags in English and Persian", fa: "به‌روزرسانی مستندات داشبورد با لیست کامل ۱۳ تگ نامگذاری پشتیبانی شده در فارسی و انگلیسی" }
+                  ],
+                  notes: []
+              },
+              "2.5.7": {
+                  headline: { en: "Dynamic Multi-IP Failover & Keyless Country Flagging", fa: "لینک هوشمند آی‌پی‌ها، بهبود کلودفلر و نگاشت پرچم بدون تحریم" },
+                  added: [
+                      { en: "Support entering custom clean IPs, proxy IPs, and custom config names for each subscriber dynamically in Add/Edit user modals, with automatic extraction and seamless database merging", fa: "امکان ثبت آی‌پی تمیز دلخواه، آی‌پی پروکسی دلخواه و نام کانفیگ دلخواه برای هر کاربر به صورت مجزا با قابلیت استخراج خودکار و ادغام هوشمند" },
+                      { en: "Integrated free, open-source and keyless api.country.is for country flag mapping of IP addresses", fa: "یکپارچه‌سازی وب‌سرویس رایگان و متن‌باز api.country.is جهت نگاشت پرچم کشورهای مربوط به آدرس‌های آی‌پی" }
+                  ],
+                  fixed: [
+                      { en: "Resolved Cloudflare API compatibility flag error ('No such compatibility flag: unsafe-eval' and startup 'Uncaught EvalError') by updating to 'allow_eval_during_startup'", fa: "رفع خطای ناسازگاری فلگ کلودفلر (خطای عدم وجود فلگ unsafe-eval و خطای زمان شروع کار EvalError) در بخش استقرار خودکار با بازنویسی به فلگ مدرن allow_eval_during_startup" },
+                      { en: "Fixed a critical issue where selecting multiple proxy IPs for a user caused session disruptions (IP splitting) on sites behind Cloudflare, resolved via user-consistent hashing and smart proxy failover", fa: "رفع مشکل عدم باز شدن وب‌سایت‌های پشت کلودفلر هنگام انتخاب چندین آی‌پی پروکسی با پیاده‌سازی مکانیزم Hashing پایدار کاربر و سوییچ خودکار (Failover) بر روی پروکسی‌های جایگزین" },
+                      { en: "Fixed client-side regular expression parsing to correctly split global IPs separated by backslashes, tabs, commas, or semicolons in the browser", fa: "اصلاح عبارات منظم فرانت‌اند در مروگر جهت تفکیک صحیح لیست آی‌پی‌های تفکیک شده با اینتر، ویرگول، نقطه ویرگول یا بک‌اسلش" }
+                  ],
+                  improved: [
+                      { en: "Enhanced reliability of user management dashboard modals and subscription validation logic", fa: "بهبود پایداری پنجره‌های مدیریتی داشبورد و منطق بررسی اعتبار اشتراک‌ها" }
+                  ],
+                  notes: []
+              },
+              "2.5.6.1": {
+                  headline: { en: "Multi-IP Management & Crucial Bug Fixes", fa: "مدیریت آی‌پی‌های چندگانه و رفع خطاهای بحرانی" },
+                  added: [
+                      { en: "Support setting custom config name, custom proxy IP, and custom clean IP for each user dynamically in the Add User modal", fa: "اضافه شدن امکان ثبت نام کانفیگ دلخواه، آی‌پی پروکسی اختصاصی و آی‌پی تمیز اختصاصی به صورت مجزا برای هر کاربر در پنجره افزودن کاربر" }
+                  ],
+                  fixed: [
+                      { en: "Fixed a critical JavaScript rollback error ('ReferenceError: proxyIp is not defined') when adding a new user", fa: "رفع خطای بحرانی جاوااسکریپت ('ReferenceError: proxyIp is not defined') هنگام تلاش برای افزودن یک کاربر جدید" }
+                  ],
+                  improved: [
+                      { en: "Streamlined alignment of custom user values with subscription generation", fa: "بهبود همگام‌سازی مقادیر اختصاصی کاربران با فرایند ساخت کانفیگ‌ها در اشتراک" }
+                  ],
+                  notes: []
+              },
+              "2.5.6": {
+                  headline: { en: "Multiple Proxy IPs & Flag Matching", fa: "آی‌پی‌های پروکسی متعدد و انطباق پرچم" },
+                  added: [
+                      { en: "Support multi-proxy IP lists (rotated/distributed across generated configs to bypass Cloudflare limits)", fa: "پشتیبانی از لیست‌های آی‌پی پروکسی چندگانه (چرخش و توزیع خودکار میان کانفیگ‌ها برای عبور از محدودیت‌های کلودفلر)" },
+                      { en: "Proper country flag matching for configs based on the actual proxy IP used", fa: "انطباق صحیح پرچم کشور برای کانفیگ‌ها بر اساس آی‌پی پروکسی واقعی استفاده‌شده" }
+                  ],
+                  fixed: [
+                      { en: "Fixed outbound transport and websocket configurations formatting errors", fa: "رفع خطاهای فرمت‌دهی در کانفیگ‌های حمل و نقل خروجی و وب‌ساکت" }
+                  ],
+                  improved: [
+                      { en: "Distributed multiple proxy IPs evenly across subscription sub-configs", fa: "توزیع یکنواخت چندین آی‌پی پروکسی میان زیرکانفیگ‌های اشتراک" },
+                      { en: "Enhanced IP API resolving and flag caching logic", fa: "بهبود منطق حل‌وفصل و کش پرچم برای آی‌پی‌ها" }
+                  ],
+                  notes: []
+              },
+              "2.5.5": {
+                  headline: { en: "One-Click Panel Update", fa: "بروزرسانی پنل با یک کلیک" },
+                  added: [
+                      { en: "Update the panel directly from the admin panel — no need to use Cloudflare dashboard", fa: "بروزرسانی پنل مستقیماً از پنل مدیریت — بدون نیاز به داشبورد کلودفلر" },
+                      { en: "One-click deployment inside the panel for quick and easy updates", fa: "نصب با یک کلیک داخل پنل برای بروزرسانی سریع و آسان" },
+                  ],
+                  fixed: [],
+                  improved: [
+                      { en: "Improved stability and reliability of the update system", fa: "بهبود پایداری و اطمینان سیستم بروزرسانی" },
+                  ],
+                  notes: []
+              },
+              "2.5.4.2": {
+                  headline: { en: "Performance Optimization & Background Processing", fa: "بهینه‌سازی عملکرد و پردازش پس‌زمینه" },
+                  added: [],
+                  fixed: [],
+                  improved: [
+                      { en: "Improved system performance using smart caching (faster responses and less database load)", fa: "بهبود عملکرد سیستم با استفاده از کش هوشمند (پاسخ‌ سریع‌تر و بار کمتر روی پایگاه داده)" },
+                      { en: "Added smart caching system (TTL) for configuration and usage data", fa: "افزودن سیستم کش هوشمند (TTL) برای داده‌های تنظیمات و مصرف" },
+                      { en: "Reduced database calls to make the panel faster and more efficient", fa: "کاهش درخواست‌ها به پایگاه داده برای سریع‌تر و کاراتر شدن پنل" },
+                      { en: "Background processing added for non-critical tasks to improve speed", fa: "افزودن پردازش پس‌زمینه برای کارهای غیربحرانی جهت بهبود سرعت" },
+                  ],
+                  notes: []
+              },
+              "2.5.4.1": {
+                  headline: { en: "Security Hotfix — Bot Authorization", fa: "اصلاح امنیتی — احراز هویت ربات" },
+                  added: [],
+                  fixed: [
+                      { en: "Fixed critical issue where unauthorized users could access bot and panel data via Worker", fa: "رفع مشکل بحرانی دسترسی کاربران غیرمجاز به اطلاعات ربات و پنل از طریق Worker" },
+                      { en: "Added proper Telegram user ID validation for all Worker-related requests", fa: "افزودن بررسی صحیح آیدی عددی تلگرام برای تمام درخواست‌های مربوط به Worker" },
+                  ],
+                  improved: [
+                      { en: "Only users with approved admin IDs can interact with the bot and access panel data", fa: "فقط کاربرانی که آیدی آن‌ها در لیست ادمین‌ها ثبت شده باشد اجازه دسترسی به ربات و اطلاعات پنل را دارند" },
+                      { en: "Unauthorized users now receive a clear access denied message", fa: "کاربران غیرمجاز اکنون پیام خطای دسترسی مناسب دریافت می‌کنند" },
+                  ],
+                  notes: [
+                      { en: "Security update — recommended for all users", fa: "به‌روزرسانی امنیتی — توصیه‌شده برای تمام کاربران" },
+                  ]
+              },
               "2.5.4": {
                   headline: { en: "Overview Dashboard & Mobile Improvements", fa: "داشبورد نمای کلی و بهبود نمایش در موبایل" },
                   added: [
@@ -4902,7 +6871,7 @@ function getDashboardUI(hasDB) {
               
               const data = CHANGELOG_DATA[version];
               if (!data) {
-                  container.innerHTML = '<p class="text-slate-400 text-xs">No changelog available for this version.</p>';
+                  container.innerHTML = '<p class="text-slate-400 text-xs">' + (i18n[lang]?.no_changelog || 'No changelog available for this version.') + '</p>';
                   return;
               }
 
@@ -4940,7 +6909,7 @@ function getDashboardUI(hasDB) {
                   }
               });
 
-              container.innerHTML = html || '<p class="text-slate-400 text-xs">No changes documented.</p>';
+              container.innerHTML = html || '<p class="text-slate-400 text-xs">' + (i18n[lang]?.no_changes || 'No changes documented.') + '</p>';
           }
 
           let lang = localStorage.getItem('lang') || 'fa';
@@ -4972,8 +6941,18 @@ function getDashboardUI(hasDB) {
                       if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
                           el.placeholder = i18n[lang][key];
                       } else {
-                          el.innerText = i18n[lang][key];
+                          if (key.startsWith('html_')) {
+                              el.innerHTML = i18n[lang][key];
+                          } else {
+                              el.innerText = i18n[lang][key];
+                          }
                       }
+                  }
+              });
+              document.querySelectorAll('[data-i18n-placeholder]').forEach(el => {
+                  const key = el.getAttribute('data-i18n-placeholder');
+                  if (i18n[lang] && i18n[lang][key] !== undefined && i18n[lang][key] !== null) {
+                      el.placeholder = i18n[lang][key];
                   }
               });
               const gbUnit = i18n[lang]?.ov_gb_unit || 'GB';
@@ -4984,7 +6963,19 @@ function getDashboardUI(hasDB) {
               const statTrafficEl = document.getElementById('stat-total-traffic');
               if (statTrafficEl && statTrafficEl.textContent.trim() === '0 GB') statTrafficEl.textContent = '0 ' + gbUnit;
           }
-          function toggleLang() { lang = lang === 'fa' ? 'en' : 'fa'; localStorage.setItem('lang', lang); applyLang(); updateTitle(); updateUI(); }
+          function toggleLang() { 
+              lang = lang === 'fa' ? 'en' : 'fa'; 
+              localStorage.setItem('lang', lang); 
+              applyLang(); 
+              updateTitle(); 
+              updateUI(); 
+              try {
+                  const m = document.getElementById('modal-version-update');
+                  if (m && !m.classList.contains('hidden')) {
+                      renderChangelog(CURRENT_VERSION);
+                  }
+              } catch(e){}
+          }
           applyLang();
   
           if (localStorage.getItem('theme') === 'dark' || (!('theme' in localStorage) && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
@@ -5051,21 +7042,21 @@ function getDashboardUI(hasDB) {
         async function loadLogs() {
             const container = document.getElementById('logs-container');
             if(!container) return;
-            container.innerHTML = '<p class="text-sm text-slate-400 text-center py-4">Loading logs...</p>';
+            container.innerHTML = '<p class="text-sm text-slate-400 text-center py-4">' + (i18n[lang]?.loading_logs || 'Loading logs...') + '</p>';
             try {
                 const res = await fetch(baseRoute + '/api/logs', { method: 'POST', body: JSON.stringify({ key: sessionKey }) });
                 const data = await res.json();
                 if (data.success && data.logs) {
-                    container.innerHTML = '';
                     if (data.logs.length === 0) {
-                        container.innerHTML = '<p class="text-sm text-slate-400 text-center py-4">No activity logs found.</p>';
+                        container.innerHTML = '<p class="text-sm text-slate-400 text-center py-4">' + (i18n[lang]?.no_activity_logs || 'No activity logs found.') + '</p>';
                         return;
                     }
+                    let logsHtml = '';
                     data.logs.forEach(log => {
                         const dateStr = new Date(log.ts).toLocaleString('en-US', {hour12: false});
-                        const html = \`<div class="flex flex-col sm:flex-row sm:items-center justify-between p-3 bg-slate-50 dark:bg-slate-800 rounded-xl border border-slate-100 dark:border-darkborder/50 gap-2"><div><p class="text-sm font-bold text-slate-700 dark:text-slate-200">\${log.type}</p><p class="text-xs text-slate-500 truncate max-w-[200px] sm:max-w-xs" title="\${log.detail}">\${log.detail}</p></div><span class="text-[10px] font-mono text-slate-400 bg-white dark:bg-darkcard px-2 py-1 rounded shrink-0">\${dateStr}</span></div>\`;
-                        container.insertAdjacentHTML('beforeend', html);
+                        logsHtml += \`<div class="flex flex-col sm:flex-row sm:items-center justify-between p-3 bg-slate-50 dark:bg-slate-800 rounded-xl border border-slate-100 dark:border-darkborder/50 gap-2"><div><p class="text-sm font-bold text-slate-700 dark:text-slate-200">\${log.type}</p><p class="text-xs text-slate-500 truncate max-w-[200px] sm:max-w-xs" title="\${log.detail}">\${log.detail}</p></div><span class="text-[10px] font-mono text-slate-400 bg-white dark:bg-darkcard px-2 py-1 rounded shrink-0">\${dateStr}</span></div>\`;
                     });
+                    container.innerHTML = logsHtml;
                 } else {
                     container.innerHTML = '<p class="text-sm text-red-400 text-center py-4">Failed to load logs.</p>';
                 }
@@ -5100,15 +7091,16 @@ function getDashboardUI(hasDB) {
 
                 const actList = document.getElementById('ov-activity-list');
                 if (logsData.success && logsData.logs && logsData.logs.length > 0) {
-                    actList.innerHTML = '';
+                    let actHtml = '';
                     logsData.logs.slice(0, 8).forEach(log => {
                         const dateStr = new Date(log.ts).toLocaleString('en-US', {hour12: false});
                         const typeColors = { 'Auth Success': 'bg-emerald-500', 'Auth Failed': 'bg-red-500', 'User Created': 'bg-blue-500', 'User Deleted': 'bg-red-500', 'User Toggled': 'bg-amber-500', 'User Updated': 'bg-indigo-500', 'User Auto-Disabled': 'bg-red-500', 'Traffic Reset': 'bg-cyan-500', 'Config Changed': 'bg-violet-500' };
                         const dotColor = typeColors[log.type] || 'bg-slate-400';
-                        actList.insertAdjacentHTML('beforeend', '<div class="flex items-center gap-3 p-3 bg-slate-50 dark:bg-slate-800/50 rounded-xl"><div class="w-2 h-2 rounded-full shrink-0 ' + dotColor + '"></div><div class="flex-1 min-w-0"><p class="text-sm font-semibold text-slate-700 dark:text-slate-200 truncate">' + log.type + '</p><p class="text-[11px] text-slate-400 truncate">' + log.detail + '</p></div><span class="text-[10px] font-mono text-slate-400 shrink-0">' + dateStr + '</span></div>');
+                        actHtml += '<div class="flex items-center gap-3 p-3 bg-slate-50 dark:bg-slate-800/50 rounded-xl"><div class="w-2 h-2 rounded-full shrink-0 ' + dotColor + '"></div><div class="flex-1 min-w-0"><p class="text-sm font-semibold text-slate-700 dark:text-slate-200 truncate">' + log.type + '</p><p class="text-[11px] text-slate-400 truncate">' + log.detail + '</p></div><span class="text-[10px] font-mono text-slate-400 shrink-0">' + dateStr + '</span></div>';
                     });
+                    actList.innerHTML = actHtml;
                 } else {
-                    actList.innerHTML = '<p class="text-sm text-slate-400 text-center py-6">No recent activity.</p>';
+                    actList.innerHTML = '<p class="text-sm text-slate-400 text-center py-6">' + (i18n[lang]?.no_recent_activity || 'No recent activity.') + '</p>';
                 }
             } catch (err) {
                 console.error('Dashboard load error:', err);
@@ -5170,6 +7162,79 @@ function getDashboardUI(hasDB) {
               localStorage.removeItem('nahan_session');
               window.location.reload();
           }
+
+          function renderFakeConfigs(configs) {
+              const list = document.getElementById('fake-configs-list');
+              if (!list) return;
+              list.innerHTML = '';
+              if (!configs || configs.length === 0) {
+                  configs = [
+                      { name: "📊 {usage}", enabled: true },
+                      { name: "📅 {expiry}", enabled: true }
+                  ];
+              }
+              configs.forEach((cfg, idx) => {
+                  const item = document.createElement('div');
+                  item.className = 'flex items-center gap-2 p-3 bg-slate-50 dark:bg-slate-800/50 rounded-xl border border-slate-200 dark:border-darkborder/50';
+                  item.innerHTML = \`
+                      <div class="relative inline-flex items-center cursor-pointer shrink-0">
+                          <input type="checkbox" \${cfg.enabled ? 'checked' : ''} onchange="toggleFakeConfig(\${idx})" class="sr-only peer">
+                          <div class="w-9 h-5 bg-slate-300 dark:bg-slate-600 rounded-full peer peer-checked:after:translate-x-4 rtl:peer-checked:after:-translate-x-4 peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-primary"></div>
+                      </div>
+                      <input type="text" value="\${cfg.name.replace(/"/g, '&quot;')}" onchange="updateFakeConfigName(\${idx}, this.value)" class="flex-1 min-w-0 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-darkborder bg-white dark:bg-slate-900 focus:border-primary outline-none text-sm font-mono">
+                      <button onclick="moveFakeConfig(\${idx}, -1)" class="p-1.5 hover:bg-slate-200 dark:hover:bg-slate-700 rounded-lg transition-colors shrink-0" title="Move up">
+                          <svg class="w-3.5 h-3.5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 15l7-7 7 7"></path></svg>
+                      </button>
+                      <button onclick="moveFakeConfig(\${idx}, 1)" class="p-1.5 hover:bg-slate-200 dark:hover:bg-slate-700 rounded-lg transition-colors shrink-0" title="Move down">
+                          <svg class="w-3.5 h-3.5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                      </button>
+                      <button onclick="removeFakeConfig(\${idx})" class="p-1.5 hover:bg-red-100 dark:hover:bg-red-900/30 rounded-lg transition-colors shrink-0" title="Remove">
+                          <svg class="w-3.5 h-3.5 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                      </button>
+                  \`;
+                  list.appendChild(item);
+              });
+              window._fakeConfigs = configs;
+          }
+
+          function addFakeConfig() {
+              if (!window._fakeConfigs) window._fakeConfigs = [];
+              window._fakeConfigs.push({ name: "Custom Entry", enabled: true });
+              renderFakeConfigs(window._fakeConfigs);
+          }
+
+          function removeFakeConfig(idx) {
+              if (!window._fakeConfigs) return;
+              window._fakeConfigs.splice(idx, 1);
+              renderFakeConfigs(window._fakeConfigs);
+          }
+
+          function toggleFakeConfig(idx) {
+              if (!window._fakeConfigs || !window._fakeConfigs[idx]) return;
+              window._fakeConfigs[idx].enabled = !window._fakeConfigs[idx].enabled;
+          }
+
+          function updateFakeConfigName(idx, value) {
+              if (!window._fakeConfigs || !window._fakeConfigs[idx]) return;
+              window._fakeConfigs[idx].name = value;
+          }
+
+          function moveFakeConfig(idx, direction) {
+              if (!window._fakeConfigs) return;
+              const newIdx = idx + direction;
+              if (newIdx < 0 || newIdx >= window._fakeConfigs.length) return;
+              const temp = window._fakeConfigs[idx];
+              window._fakeConfigs[idx] = window._fakeConfigs[newIdx];
+              window._fakeConfigs[newIdx] = temp;
+              renderFakeConfigs(window._fakeConfigs);
+          }
+
+          function getFakeConfigsFromUI() {
+              return window._fakeConfigs || [
+                  { name: "📊 {usage}", enabled: true },
+                  { name: "📅 {expiry}", enabled: true }
+              ];
+          }
   
           // Export active page inputs configuration
           function exportConfig() {
@@ -5177,14 +7242,16 @@ function getDashboardUI(hasDB) {
               const payload = {
                   mode: el('cfg-proto').value, socketPorts: Array.from(el('cfg-port').selectedOptions).map(o=>o.value).join(','), deviceId: el('cfg-uuid').value,
                   apiRoute: el('cfg-path').value, masterKey: el('cfg-pass').value, agent: el('cfg-fp').value,
-                  resolveIp: el('cfg-dns').value, customDns: el('cfg-custom-dns').value ? el('cfg-custom-dns').value : 'https://cloudflare-dns.com/dns-query', cleanIps: el('cfg-ips').value, maintenanceHost: el('cfg-fake').value, backupRelay: el('cfg-relay').value,
+                  resolveIp: el('cfg-dns').value, customDns: el('cfg-custom-dns').value ? el('cfg-custom-dns').value : 'https://cloudflare-dns.com/dns-query', cleanIps: el('cfg-ips').value, maintenanceHost: el('cfg-fake').value, backupRelay: el('cfg-relay').value, nat64Prefix: el('cfg-nat64') ? el('cfg-nat64').value : '', enableDirectConfigs: el('cfg-direct-configs') ? el('cfg-direct-configs').checked : false, autoUpdate: el('cfg-auto-update') ? el('cfg-auto-update').checked : false, autoUpdateFormat: document.querySelector('input[name="auto-update-format"]:checked')?.value || 'normal',
                   enableOpt1: el('cfg-tfo').checked, enableOpt2: el('cfg-ech').checked,
                   tgToken: el('cfg-tg-token').value, tgChatId: el('cfg-tg-chat').value, tgAdminId: el('cfg-tg-admin').value,
                   cfAccountId: el('cfg-cf-acc').value, cfApiToken: el('cfg-cf-token').value,
+                  cfWorkerName: el('cfg-cf-worker').value,
                   isPaused: el('cfg-pause').checked, silentAlerts: el('cfg-silent').checked,
                   githubRepo: el('cfg-github-repo').value,
                   subUserAgent: el('cfg-sub-ua').value,
-                  customPanelUrl: el('cfg-custom-panel-url').value
+                  customPanelUrl: el('cfg-custom-panel-url').value,
+                  fakeConfigs: getFakeConfigsFromUI()
               };
               const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(payload, null, 2));
               const dlAnchor = document.createElement('a');
@@ -5221,6 +7288,7 @@ function getDashboardUI(hasDB) {
                       mapId('cfg-tg-admin', conf.tgAdminId);
                       mapId('cfg-cf-acc', conf.cfAccountId);
                       mapId('cfg-cf-token', conf.cfApiToken);
+                      mapId('cfg-cf-worker', conf.cfWorkerName);
                       mapId('cfg-github-repo', conf.githubRepo);
                       mapId('cfg-sub-ua', conf.subUserAgent);
                       mapId('cfg-custom-panel-url', conf.customPanelUrl);
@@ -5229,6 +7297,19 @@ function getDashboardUI(hasDB) {
                       if (conf.enableOpt2 !== undefined) document.getElementById('cfg-ech').checked = conf.enableOpt2;
                       if (conf.isPaused !== undefined) document.getElementById('cfg-pause').checked = conf.isPaused;
                       if (conf.silentAlerts !== undefined) document.getElementById('cfg-silent').checked = conf.silentAlerts;
+                      mapId('cfg-nat64', conf.nat64Prefix);
+                      if (conf.enableDirectConfigs !== undefined && document.getElementById('cfg-direct-configs')) document.getElementById('cfg-direct-configs').checked = conf.enableDirectConfigs;
+                      if (conf.autoUpdate !== undefined && document.getElementById('cfg-auto-update')) {
+                          document.getElementById('cfg-auto-update').checked = conf.autoUpdate;
+                          const wrap = document.getElementById('auto-update-format-wrap');
+                          if (wrap) wrap.classList.toggle('hidden', !conf.autoUpdate);
+                      }
+                      if (conf.autoUpdateFormat) {
+                          const radio = document.querySelector(\`input[name="auto-update-format"][value="\${conf.autoUpdateFormat}"]\`);
+                          if (radio) radio.checked = true;
+                      }
+                      
+                      if (conf.fakeConfigs) renderFakeConfigs(conf.fakeConfigs);
                       
                       updateUI();
                       alert(lang === 'fa' ? 'پیکربندی با موفقیت وارد شد! روی ذخیره کلیک کنید.' : 'Configuration parsed! Click save to write changes.');
@@ -5307,6 +7388,7 @@ function getDashboardUI(hasDB) {
                       document.getElementById('dash-box').classList.remove('hidden');
                       document.getElementById('dash-box').classList.add('flex');
                       document.getElementById('btn-logout-mob').classList.remove('hidden');
+                      document.body.classList.add('logged-in');
                       
                       document.getElementById('net-ip').textContent = data.network.ip;
                       document.getElementById('net-colo').textContent = data.network.colo;
@@ -5325,14 +7407,27 @@ function getDashboardUI(hasDB) {
                       document.getElementById('cfg-ips').value = conf.cleanIps || '';
                       document.getElementById('cfg-nodes').value = conf.slaveNodes || '';
                       document.getElementById('cfg-fake').value = conf.maintenanceHost || '';
-                      document.getElementById('cfg-relay').value = conf.backupRelay || '';
+                       document.getElementById('cfg-relay').value = conf.backupRelay || '';
+                       if (document.getElementById('cfg-nat64')) document.getElementById('cfg-nat64').value = conf.nat64Prefix || '';
+                       if (document.getElementById('cfg-direct-configs')) document.getElementById('cfg-direct-configs').checked = conf.enableDirectConfigs || false;
+                       if (document.getElementById('cfg-auto-update')) {
+                           document.getElementById('cfg-auto-update').checked = conf.autoUpdate || false;
+                           const wrap = document.getElementById('auto-update-format-wrap');
+                           if (wrap) wrap.classList.toggle('hidden', !conf.autoUpdate);
+                       }
+                       if (conf.autoUpdateFormat) {
+                           const radio = document.querySelector(\`input[name="auto-update-format"][value="\${conf.autoUpdateFormat}"]\`);
+                           if (radio) radio.checked = true;
+                       }
                       document.getElementById('cfg-tfo').checked = conf.enableOpt1 || false;
                       document.getElementById('cfg-ech').checked = conf.enableOpt2 || false;
+                      document.getElementById('cfg-allow-sync').checked = conf.allowSyncWorker || false;
                       document.getElementById('cfg-tg-token').value = conf.tgToken || '';
                       document.getElementById('cfg-tg-chat').value = conf.tgChatId || '';
                       document.getElementById('cfg-tg-admin').value = conf.tgAdminId || '';
                       document.getElementById('cfg-cf-acc').value = conf.cfAccountId || '';
                       document.getElementById('cfg-cf-token').value = conf.cfApiToken || '';
+                      document.getElementById('cfg-cf-worker').value = conf.cfWorkerName || '';
                       document.getElementById('cfg-pause').checked = conf.isPaused || false;
                       document.getElementById('cfg-silent').checked = conf.silentAlerts || false;
                       document.getElementById('cfg-github-repo').value = conf.githubRepo || 'itsyebekhe/nahan';
@@ -5340,6 +7435,10 @@ function getDashboardUI(hasDB) {
                       document.getElementById('cfg-name-prefix').value = conf.namePrefix || 'Core';
                       document.getElementById('cfg-sub-ua').value = conf.subUserAgent || '';
                       document.getElementById('cfg-custom-panel-url').value = conf.customPanelUrl || '';
+                      renderFakeConfigs(conf.fakeConfigs || [
+                          { name: "📊 {usage}", enabled: true },
+                          { name: "📅 {expiry}", enabled: true }
+                      ]);
   
                       window.nahanConfig = JSON.parse(JSON.stringify(conf));
                       window.nahanUsage = data.sysUsage || {};
@@ -5356,22 +7455,38 @@ function getDashboardUI(hasDB) {
                           const el = document.getElementById(id);
                           if(el) el.addEventListener('change', updateUI);
                       });
+                      const autoUpdateEl = document.getElementById('cfg-auto-update');
+                      if (autoUpdateEl) {
+                          autoUpdateEl.addEventListener('change', () => {
+                              const wrap = document.getElementById('auto-update-format-wrap');
+                              if (wrap) wrap.classList.toggle('hidden', !autoUpdateEl.checked);
+                          });
+                      }
 
                       
             
                      window.toggleAccordion = function(btn) 
                         {
                             const card = btn.closest('[data-accordion]');
+                            if (!card) return;
                             const content = card.querySelector('[data-accordion-content]');
                             const icon = btn.querySelector('.accordion-icon');
-                            const isOpen = content.style.maxHeight && content.style.maxHeight !== '0px';
+                            const isOpen = content.style.visibility === 'visible';
+
+                            content.style.transition = 'max-height 0.3s ease, visibility 0.3s ease';
 
                             if (isOpen) {
-                                content.style.maxHeight = '0';
+                                content.style.maxHeight = content.scrollHeight + 'px';
+                                requestAnimationFrame(() => {
+                                    content.style.maxHeight = '0';
+                                    content.style.visibility = 'hidden';
+                                });
                                 icon.style.transform = 'rotate(0deg)';
                             } else {
+                                content.style.visibility = 'visible';
                                 content.style.maxHeight = content.scrollHeight + 'px';
                                 icon.style.transform = 'rotate(180deg)';
+                                setTimeout(() => { if (content.style.visibility === 'visible') content.style.maxHeight = 'none'; }, 350);
                             }
                         }
 
@@ -5382,7 +7497,7 @@ function getDashboardUI(hasDB) {
                     showQR(btn.dataset.name, document.getElementById('sync-' + btn.dataset.id).value);
                 }
                 const pCont = document.getElementById('dyn-profiles-container');
-                pCont.innerHTML = '';
+                let profilesHtml = '';
                 data.profiles.forEach(p => {
                             const isDef = p.name === 'Default';
                             let html = \`<div class="bg-white dark:bg-darkcard rounded-3xl shadow-sm border border-slate-200 dark:border-darkborder relative mb-4 break-inside-avoid inline-block w-full" data-accordion>
@@ -5411,30 +7526,31 @@ function getDashboardUI(hasDB) {
             <div class="mt-2">
                 <button data-id="\${p.id}" data-name="\${p.name}" onclick="handleQR(this)" class="w-full flex items-center justify-center p-2.5 bg-slate-50 hover:bg-slate-100 dark:bg-slate-800 dark:hover:bg-slate-700 border border-slate-200 dark:border-darkborder rounded-xl transition-all gap-1.5 text-[11px] font-bold text-slate-600 dark:text-slate-400">
                     <svg class="w-4 h-4 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v1m0 11v1m5-7h1m-13 0h1m2-5a2 2 0 00-2 2v10a2 2 0 002 2h8a2 2 0 002-2V6a2 2 0 00-2-2h-8zM9 9h1m0 0v1m2-1h1m0 0v1"></path></svg>
-                    <span>Show QR Code</span>
+                    <span data-i18n="show_qr">Show QR Code</span>
                 </button>
             </div>
         </div>
     </div>
 </div>\`;
-                         pCont.insertAdjacentHTML('beforeend', html);
+                         profilesHtml += html;
                       });
+                      pCont.innerHTML = profilesHtml;
 
 
 
                       // Inject usage metrics table
                       const usageCont = document.getElementById('usage-metrics-container');
                       if(usageCont && data.usage) {
-                          usageCont.innerHTML = '';
+                          let usageHtml = '';
                           data.profiles.forEach(p => {
                               let hash = p.id.replace(/-/g, '').toLowerCase();
                               let use = data.usage[hash];
                               if(use) {
                                   let timeStr = new Date(use.last).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit', second:'2-digit'});
-                                  usageCont.innerHTML += \`<div class="flex items-center justify-between p-3 border-b border-slate-100 dark:border-darkborder/50 last:border-0"><div class="flex flex-col"><span class="text-sm font-bold text-slate-700 dark:text-slate-200">\${p.name}</span><span class="text-[10px] text-slate-400 font-mono">\${p.id.split('-')[0]}...</span></div><div class="flex flex-col items-end"><span class="text-xs font-bold text-emerald-500">\${use.connects} Conns</span><span class="text-[10px] text-slate-400">\${timeStr}</span></div></div>\`;
+                                  usageHtml += \`<div class="flex items-center justify-between p-3 border-b border-slate-100 dark:border-darkborder/50 last:border-0"><div class="flex flex-col"><span class="text-sm font-bold text-slate-700 dark:text-slate-200">\${p.name}</span><span class="text-[10px] text-slate-400 font-mono">\${p.id.split('-')[0]}...</span></div><div class="flex flex-col items-end"><span class="text-xs font-bold text-emerald-500">\${use.connects} Conns</span><span class="text-[10px] text-slate-400">\${timeStr}</span></div></div>\`;
                               }
                           });
-                          if(usageCont.innerHTML === '') usageCont.innerHTML = '<p class="text-xs text-slate-400 text-center py-4">No active connection data yet.</p>';
+                          usageCont.innerHTML = usageHtml || '<p class="text-xs text-slate-400 text-center py-4">' + (i18n[lang]?.no_active_conn || 'No active connection data yet.') + '</p>';
                       }
                       
                       updateUI();
@@ -5452,16 +7568,19 @@ function getDashboardUI(hasDB) {
                   config: {
                       mode: el('cfg-proto').value, socketPorts: Array.from(el('cfg-port').selectedOptions).map(o=>o.value).join(','), deviceId: el('cfg-uuid').value,
                       apiRoute: el('cfg-path').value, masterKey: el('cfg-pass').value, agent: el('cfg-fp').value,
-                      resolveIp: el('cfg-dns').value, customDns: el('cfg-custom-dns').value ? el('cfg-custom-dns').value : 'https://cloudflare-dns.com/dns-query', cleanIps: el('cfg-ips').value, slaveNodes: el('cfg-nodes').value, maintenanceHost: el('cfg-fake').value, backupRelay: el('cfg-relay').value,
+                      resolveIp: el('cfg-dns').value, customDns: el('cfg-custom-dns').value ? el('cfg-custom-dns').value : 'https://cloudflare-dns.com/dns-query', cleanIps: el('cfg-ips').value, slaveNodes: el('cfg-nodes').value, maintenanceHost: el('cfg-fake').value, backupRelay: el('cfg-relay').value, nat64Prefix: el('cfg-nat64') ? el('cfg-nat64').value : '', enableDirectConfigs: el('cfg-direct-configs') ? el('cfg-direct-configs').checked : false, autoUpdate: el('cfg-auto-update') ? el('cfg-auto-update').checked : false, autoUpdateFormat: document.querySelector('input[name="auto-update-format"]:checked')?.value || 'normal',
                       enableOpt1: el('cfg-tfo').checked, enableOpt2: el('cfg-ech').checked,
                       tgToken: el('cfg-tg-token').value, tgChatId: el('cfg-tg-chat').value, tgAdminId: el('cfg-tg-admin').value,
                       cfAccountId: el('cfg-cf-acc').value, cfApiToken: el('cfg-cf-token').value,
+                      cfWorkerName: el('cfg-cf-worker').value,
                       isPaused: el('cfg-pause').checked, silentAlerts: el('cfg-silent').checked,
                       githubRepo: el('cfg-github-repo').value,
                       subUserAgent: el('cfg-sub-ua').value,
                       customPanelUrl: el('cfg-custom-panel-url').value,
                       nameStrategy: el('cfg-name-strategy').value,
-                      namePrefix: el('cfg-name-prefix').value
+                      allowSyncWorker: el('cfg-allow-sync').checked,
+                      namePrefix: el('cfg-name-prefix').value,
+                      fakeConfigs: getFakeConfigsFromUI()
                   }
               };
                         //update user port after change global
@@ -5502,16 +7621,18 @@ function getDashboardUI(hasDB) {
                   config: {
                       mode: el('cfg-proto').value, socketPorts: Array.from(el('cfg-port').selectedOptions).map(o=>o.value).join(','), deviceId: el('cfg-uuid').value,
                       apiRoute: el('cfg-path').value, masterKey: el('cfg-pass').value, agent: el('cfg-fp').value,
-                      resolveIp: el('cfg-dns').value, customDns: el('cfg-custom-dns').value ? el('cfg-custom-dns').value : 'https://cloudflare-dns.com/dns-query', cleanIps: el('cfg-ips').value, slaveNodes: el('cfg-nodes').value, maintenanceHost: el('cfg-fake').value, backupRelay: el('cfg-relay').value,
+                      resolveIp: el('cfg-dns').value, customDns: el('cfg-custom-dns').value ? el('cfg-custom-dns').value : 'https://cloudflare-dns.com/dns-query', cleanIps: el('cfg-ips').value, slaveNodes: el('cfg-nodes').value, maintenanceHost: el('cfg-fake').value, backupRelay: el('cfg-relay').value, nat64Prefix: el('cfg-nat64') ? el('cfg-nat64').value : '', enableDirectConfigs: el('cfg-direct-configs') ? el('cfg-direct-configs').checked : false, autoUpdate: el('cfg-auto-update') ? el('cfg-auto-update').checked : false, autoUpdateFormat: document.querySelector('input[name="auto-update-format"]:checked')?.value || 'normal',
                       enableOpt1: el('cfg-tfo').checked, enableOpt2: el('cfg-ech').checked,
                       tgToken: el('cfg-tg-token').value, tgChatId: el('cfg-tg-chat').value, tgAdminId: el('cfg-tg-admin').value,
                       cfAccountId: el('cfg-cf-acc').value, cfApiToken: el('cfg-cf-token').value,
+                      cfWorkerName: el('cfg-cf-worker').value,
                       isPaused: el('cfg-pause').checked, silentAlerts: el('cfg-silent').checked,
                       githubRepo: el('cfg-github-repo').value,
                       subUserAgent: el('cfg-sub-ua').value,
                       customPanelUrl: el('cfg-custom-panel-url').value,
                       nameStrategy: el('cfg-name-strategy').value,
-                      namePrefix: el('cfg-name-prefix').value
+                      namePrefix: el('cfg-name-prefix').value,
+                      fakeConfigs: getFakeConfigsFromUI()
                   }
               };
               
@@ -5606,16 +7727,17 @@ function getDashboardUI(hasDB) {
 
               tbl.innerHTML = '';
               if (filteredUsers.length === 0) {
-                  tbl.innerHTML = '<tr><td colspan="5" class="px-4 py-8 text-center text-slate-400">No matching subscribers found</td></tr>';
+                  tbl.innerHTML = '<div class="col-span-full px-4 py-8 text-center text-slate-400 text-sm">' + (i18n[lang]?.no_matching_users || 'No matching subscribers found') + '</div>';
                   return;
               }
               
               // Alias users to the filtered list for downstream compatibility
               users = filteredUsers;
               if (users.length === 0) {
-                  tbl.innerHTML = \`<tr><td colspan="5" class="px-4 py-8 text-center text-slate-400" data-i18n="no_users">\${i18n[lang].no_users}</td></tr>\`;
+                  tbl.innerHTML = \`<div class="col-span-full px-4 py-8 text-center text-slate-400 text-sm" data-i18n="no_users">\${i18n[lang].no_users}</div>\`;
                   return;
               }
+              let tblHtml = '';
               users.forEach((u, i) => {
                   let sysU = usage[u.id.replace(/-/g,'').toLowerCase()] || {reqs: 0, dReqs: 0, lastDay: ''};
                   let userReqs = sysU.reqs || 0;
@@ -5677,56 +7799,53 @@ function getDashboardUI(hasDB) {
                       \`;
                   }
 
-                  let tr = document.createElement('tr');
-                  tr.className = "hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors";
-                  
                   let rawSync = window.nahanProfiles?.find(p => p.id === u.id)?.sync || '';
                   if (rawSync) {
                       rawSync += rawSync.includes('?') ? '&flag=a' : '?flag=a';
                   }
 
-                  tr.innerHTML = \`
-                      <td class="px-4 py-4 font-bold text-slate-700 dark:text-slate-300">\${u.name} \${u.isPaused ? (isAutoDisabled ? '🚫' : '⏸️') : (isExp ? '🔴' : '🟢')}
-                          <div class="flex flex-wrap gap-1 mt-1">
-                              \${u.isPaused && u.disabledReason ? \`<span class="text-[9px] font-bold px-1.5 py-0.5 rounded-md bg-red-100 dark:bg-red-900/40 text-red-600 dark:text-red-300">Auto-Disabled</span>\` : ''}
-                              \${u.userMode ? \`<span class="text-[9px] font-bold px-1.5 py-0.5 rounded-md bg-indigo-100 dark:bg-indigo-900/40 text-indigo-600 dark:text-indigo-300">\${u.userMode === 'alpha' ? 'VLESS' : u.userMode === 'beta' ? 'Trojan' : 'VLESS+Trojan'}</span>\` : ''}
-                              \${u.userPorts ? \`<span class="text-[9px] font-bold px-1.5 py-0.5 rounded-md bg-emerald-100 dark:bg-emerald-900/40 text-emerald-600 dark:text-emerald-300">🔌 \${u.userPorts}</span>\` : ''}
-                              \${u.maxConfigs ? \`<span class="text-[9px] font-bold px-1.5 py-0.5 rounded-md bg-amber-100 dark:bg-amber-900/40 text-amber-600 dark:text-amber-300">max \${u.maxConfigs} cfgs</span>\` : ''}
+                  tblHtml += \`<div class="bg-white dark:bg-darkcard rounded-2xl border border-slate-200 dark:border-darkborder p-4 hover:shadow-md transition-shadow">
+                      <div class="flex items-center justify-between mb-2">
+                          <div class="flex items-center gap-2 min-w-0">
+                              <span class="w-2 h-2 rounded-full shrink-0 \${u.isPaused ? (isAutoDisabled ? 'bg-red-500' : 'bg-amber-500') : (isExp ? 'bg-red-400' : 'bg-emerald-500')}"></span>
+                              <span class="font-bold text-sm text-slate-800 dark:text-slate-100 truncate">\${u.name}</span>
+                              \${u.proxyIpGeo ? \`<span class="text-[10px] px-1.5 py-0.5 rounded bg-violet-50 dark:bg-violet-900/30 text-violet-600 dark:text-violet-300 font-semibold">\${u.proxyIpGeo.flag}</span>\` : ''}
                           </div>
-                          \${disableInfoHtml}
-                      </td>
-                      <td class="px-4 py-4 font-mono text-xs text-slate-500 select-all">\${u.id}</td>
-                      <td class="px-4 py-4 text-slate-600 dark:text-slate-400 font-mono">
-                          <div class="flex flex-col gap-1.5">
-                              <span class="font-bold text-xs flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-emerald-500"></span>\${totalLabel} \${userReqs} \${rLabel} (\${(userReqs/6050).toFixed(2)} \${i18n[lang]?.ov_gb_unit || 'GB'}) / \${u.limitTotalReq ? (u.limitTotalReq + ' ' + rLabel + ' (' + (u.limitTotalReq/6000).toFixed(2) + ' ' + (i18n[lang]?.ov_gb_unit || 'GB') + ')') : \`\${unlimitedTxt}\`} (\${perT})</span>
-                              
-                              \${u.limitTotalReq ? \`
-                              <div class="w-full bg-slate-100 dark:bg-slate-800/80 h-2 rounded-full overflow-hidden mt-0.5 mb-1">
-                                  <div class="bg-gradient-to-r \${parseFloat(perT) > 85 ? 'from-red-500 to-rose-600' : parseFloat(perT) > 60 ? 'from-amber-500 to-orange-500' : 'from-emerald-500 to-teal-500'} h-full rounded-full transition-all duration-500" style="width: \${perT}"></div>
-                              </div>
-                              \` : ''}
-
-                              <span class="text-[11px] opacity-70 flex items-center gap-1"><span class="w-1.5 h-1.5 rounded-full bg-indigo-500"></span>\${dailyLabel} \${userDReqs} \${rLabel} (\${(userDReqs/6050).toFixed(2)} \${i18n[lang]?.ov_gb_unit || 'GB'}) / \${u.limitDailyReq ? (u.limitDailyReq + ' ' + rLabel + ' (' + (u.limitDailyReq/6050).toFixed(2) + ' ' + (i18n[lang]?.ov_gb_unit || 'GB') + ')') : \`\${unlimitedTxt}\`} (\${perD})</span>
-                              
-                              \${u.limitDailyReq ? \`
-                              <div class="w-full bg-slate-100 dark:bg-slate-800/80 h-1.5 rounded-full overflow-hidden mt-0.5">
-                                  <div class="bg-indigo-500 h-full rounded-full transition-all duration-500" style="width: \${perD}"></div>
-                              </div>
-                              \` : ''}
-                          </div>
-                      </td>
-                      <td class="px-4 py-4 text-slate-600 dark:text-slate-400">\${expTxt}</td>
-                      <td class="px-4 py-4 text-end space-x-1.5 space-x-reverse">
                           <input type="hidden" id="sync-\${u.id}" value="\${rawSync}">
-                          \${linkHtml}
-                          \${pauseBtnHtml}
-                          \${editBtnHtml}
-                          \${resetBtnHtml}
-                          <button onclick="deleteUser('\${u.id}')" class="text-red-500 hover:text-red-700 bg-red-50 hover:bg-red-100 dark:bg-red-900/30 dark:hover:bg-red-800/50 p-2 rounded-lg" title="\${deleteTitle}">🗑️</button>
-                      </td>
+                          <div class="flex items-center gap-1 shrink-0">
+                              \${linkHtml}
+                              \${pauseBtnHtml}
+                              \${editBtnHtml}
+                              \${resetBtnHtml}
+                              <button onclick="deleteUser('\${u.id}')" class="text-red-400 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/20 p-2 rounded-lg transition-colors" title="\${deleteTitle}">🗑️</button>
+                          </div>
+                      </div>
+                      <div class="flex flex-wrap gap-1 mb-2">
+                          \${u.isPaused && u.disabledReason ? \`<span class="text-[9px] font-bold px-1.5 py-0.5 rounded bg-red-100 dark:bg-red-900/40 text-red-600 dark:text-red-300">Auto-Disabled</span>\` : ''}
+                          \${u.userMode ? \`<span class="text-[9px] font-bold px-1.5 py-0.5 rounded bg-indigo-50 dark:bg-indigo-900/30 text-indigo-600 dark:text-indigo-300">\${u.userMode === 'alpha' ? 'VLESS' : u.userMode === 'beta' ? 'Trojan' : 'Both'}</span>\` : ''}
+                          \${u.userPorts ? \`<span class="text-[9px] font-bold px-1.5 py-0.5 rounded bg-emerald-50 dark:bg-emerald-900/30 text-emerald-600 dark:text-emerald-300">\${u.userPorts}</span>\` : ''}
+                          \${u.maxConfigs ? \`<span class="text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-300">\${u.maxConfigs} cfgs</span>\` : ''}
+                      </div>
+                      \${disableInfoHtml}
+                      <div class="space-y-1.5">
+                          <div class="flex items-center justify-between text-[11px]">
+                              <span class="text-slate-500">\${totalLabel} \${(userReqs/6000).toFixed(2)} GB \${u.limitTotalReq ? '/ ' + (u.limitTotalReq/6000).toFixed(2) + ' GB' : ''}</span>
+                              \${perT !== '-' ? \`<span class="font-bold \${parseFloat(perT) > 85 ? 'text-red-500' : parseFloat(perT) > 60 ? 'text-amber-500' : 'text-emerald-500'}">\${perT}</span>\` : ''}
+                          </div>
+                          \${u.limitTotalReq ? \`
+                          <div class="w-full bg-slate-100 dark:bg-slate-800 h-1.5 rounded-full overflow-hidden">
+                              <div class="bg-gradient-to-r \${parseFloat(perT) > 85 ? 'from-red-500 to-rose-600' : parseFloat(perT) > 60 ? 'from-amber-500 to-orange-500' : 'from-emerald-500 to-teal-500'} h-full rounded-full" style="width: \${perT}"></div>
+                          </div>
+                          \` : ''}
+                          <div class="flex items-center justify-between text-[10px] text-slate-400">
+                              <span>\${dailyLabel} \${userDReqs} \${rLabel}</span>
+                              <span>\${expTxt}</span>
+                          </div>
+                      </div>
                   \`;
-                  tbl.appendChild(tr);
+                  tblHtml += '</div>';
               });
+              tbl.innerHTML = tblHtml;
               applyLang();
           }
 
@@ -5789,7 +7908,73 @@ function getDashboardUI(hasDB) {
               return (window.nahanConfig && window.nahanConfig.mode) ? window.nahanConfig.mode : 'alpha';
           }
 
-          function buildPortCheckboxes(wrapId, selectedPorts) {
+          function openAddUserModal() {
+              document.getElementById('modal-add-user').classList.remove('hidden');
+              buildPortCheckboxes('add-user-ports-wrap', null);
+              buildModeCheckboxes('add-user-mode-wrap', null);
+              buildIPCheckboxes("add-user-clean-ips-wrap", "", (window.nahanConfig?.cleanIps||"").split(/[\\s,;]+/).map(s=>s.trim()).filter(Boolean));
+              buildIPCheckboxes("add-user-proxy-ips-wrap", "", (window.nahanConfig?.backupRelay||"").split(/[\\s,;]+/).map(s=>s.trim()).filter(Boolean));
+              buildNodeCheckboxes("add-user-nodes-wrap", "", (window.nahanConfig?.slaveNodes||"").split(/[\\s,;]+/).map(s=>s.trim()).filter(Boolean));
+          }
+
+          
+function buildIPCheckboxes(wrapId, selectedIps, allIps) {
+    const wrap = document.getElementById(wrapId);
+    if(!wrap) return;
+    wrap.innerHTML = '';
+    if(!allIps || allIps.length === 0) {
+        wrap.innerHTML = '<span class="text-xs text-slate-400">' + (i18n[lang]?.no_ips_advanced || 'No IPs added in Advanced Tab') + '</span>';
+        return;
+    }
+    const selArr = selectedIps ? selectedIps.split(',').map(s=>s.trim()).filter(Boolean) : [];
+    allIps.forEach(ip => {
+        const lbl = document.createElement('label');
+        lbl.className = "flex items-center gap-1.5 text-sm cursor-pointer border border-slate-200 dark:border-darkborder px-2 py-1 rounded-lg";
+        const cb = document.createElement('input');
+        cb.type = "checkbox";
+        cb.className = "accent-primary";
+        cb.value = ip;
+        if(selArr.includes(ip)) cb.checked = true;
+        
+        lbl.appendChild(cb);
+        const span = document.createElement('span');
+        span.innerText = ip;
+        lbl.appendChild(span);
+        wrap.appendChild(lbl);
+    });
+}
+function getSelectedCheckboxes(wrapId) {
+    const wrap = document.getElementById(wrapId);
+    if(!wrap) return '';
+    const checked = Array.from(wrap.querySelectorAll('input:checked')).map(cb => cb.value);
+    return checked.join(',');
+}
+function buildNodeCheckboxes(wrapId, selectedNodes, allNodes) {
+    const wrap = document.getElementById(wrapId);
+    if(!wrap) return;
+    wrap.innerHTML = '';
+    if(!allNodes || allNodes.length === 0) {
+        wrap.innerHTML = '<span class="text-xs text-slate-400">' + (i18n[lang]?.no_nodes_advanced || 'No slave nodes in Advanced Tab') + '</span>';
+        return;
+    }
+    const selArr = selectedNodes ? selectedNodes.split(',').map(s=>s.trim()).filter(Boolean) : [];
+    allNodes.forEach(node => {
+        const lbl = document.createElement('label');
+        lbl.className = "flex items-center gap-1.5 text-sm cursor-pointer border border-slate-200 dark:border-darkborder px-2 py-1 rounded-lg";
+        const cb = document.createElement('input');
+        cb.type = "checkbox";
+        cb.className = "accent-primary";
+        cb.value = node;
+        if(selArr.includes(node)) cb.checked = true;
+        lbl.appendChild(cb);
+        const span = document.createElement('span');
+        span.innerText = node;
+        lbl.appendChild(span);
+        wrap.appendChild(lbl);
+    });
+}
+
+function buildPortCheckboxes(wrapId, selectedPorts) {
               const wrap = document.getElementById(wrapId);
               if (!wrap) return;
               const globalPorts = getGlobalPorts();
@@ -5833,14 +8018,38 @@ function getDashboardUI(hasDB) {
               let dReq = document.getElementById('add-user-daily-reqs').value;
               dReq = dReq? Math.floor(parseFloat(dReq) * 6000): null;
               let days = document.getElementById('add-user-days').value;
-              const proxyIp = document.getElementById('add-user-proxy-ip').value || null;
-              const userMode = readModeFromCheckboxes('add-mode-cb');
-              const userPorts = readPortsFromCheckboxes('add-user-ports-wrap');
-              let maxConfigs = document.getElementById('add-user-max-configs').value;
-              maxConfigs = maxConfigs ? parseInt(maxConfigs) : null;
-              
-              if(!name) {
-                  alert(lang === 'fa' ? 'لطفاً نام را وارد کنید' : 'Please enter a name');
+               const cleanIpsCheckbox = getSelectedCheckboxes("add-user-clean-ips-wrap");
+               const cleanIpsCustom = document.getElementById("add-user-custom-clean").value.trim();
+               let cleanIpArray = [];
+               if (cleanIpsCheckbox) cleanIpArray.push(...cleanIpsCheckbox.split(','));
+               if (cleanIpsCustom) {
+                   cleanIpArray.push(...cleanIpsCustom.split(/[\\s,;]+/).map(s=>s.trim()).filter(Boolean));
+               }
+               const cleanIp = cleanIpArray.length ? cleanIpArray.join(',') : null;
+               const proxyIpsCheckbox = getSelectedCheckboxes("add-user-proxy-ips-wrap");
+               const proxyIpsCustom = document.getElementById("add-user-custom-proxy").value.trim();
+               let proxyIpArray = [];
+               if (proxyIpsCheckbox) proxyIpArray.push(...proxyIpsCheckbox.split(','));
+               if (proxyIpsCustom) {
+                   proxyIpArray.push(...proxyIpsCustom.split(/[\\s,;]+/).map(s=>s.trim()).filter(Boolean));
+               }
+               const proxyIp = proxyIpArray.length ? proxyIpArray.join(',') : null;
+               
+               const customName = document.getElementById('add-user-custom-name').value.trim() || null;
+               const userMode = readModeFromCheckboxes('add-mode-cb');
+               const userPorts = readPortsFromCheckboxes('add-user-ports-wrap');
+               let maxConfigs = document.getElementById('add-user-max-configs').value;
+               maxConfigs = maxConfigs ? parseInt(maxConfigs) : null;
+               const nodesCheckbox = getSelectedCheckboxes("add-user-nodes-wrap");
+               const nodesCustom = document.getElementById("add-user-custom-nodes").value.trim();
+               let nodesArray = [];
+               if (nodesCheckbox) nodesArray.push(...nodesCheckbox.split(','));
+               if (nodesCustom) nodesArray.push(...nodesCustom.split(/[\\s,;]+/).map(s=>s.trim()).filter(Boolean));
+               const userNodes = nodesArray.length ? nodesArray.join(',') : null;
+               const nat64 = document.getElementById('edit-user-nat64').value.trim() || null;
+               
+               if(!name) {
+                   alert(lang === 'fa' ? 'لطفاً نام را وارد کنید' : 'Please enter a name');
                   return;
               }
 
@@ -5866,19 +8075,26 @@ function getDashboardUI(hasDB) {
                    limitDailyReq: dReq,
                    expiryMs: days ? Date.now() + days*86400000 : null,
                    proxyIp: proxyIp,
-                   userMode: userMode,
-                   userPorts: userPorts,
-                   maxConfigs: maxConfigs,
-                   createdAt: Date.now()
+                    cleanIp: cleanIp,
+                    customName: customName,
+                    userMode: userMode,
+                    userPorts: userPorts,
+                    maxConfigs: maxConfigs,
+                    userNodes: userNodes,
+                    nat64: nat64,
+                    createdAt: Date.now()
                };
               
               window.nahanConfig.users.push(u);
               document.getElementById('modal-add-user').classList.add('hidden');
               document.getElementById('add-user-name').value = '';
+               document.getElementById('add-user-custom-name').value = '';
+               document.getElementById('add-user-custom-clean').value = '';
+               document.getElementById('add-user-custom-proxy').value = '';
+               document.getElementById('add-user-custom-nodes').value = '';
               document.getElementById('add-user-total-reqs').value = '';
               document.getElementById('add-user-daily-reqs').value = '';
               document.getElementById('add-user-days').value = '';
-              document.getElementById('add-user-proxy-ip').value = '';
               document.getElementById('add-user-max-configs').value = '';
               
               renderUsersTable();
@@ -5894,7 +8110,47 @@ function getDashboardUI(hasDB) {
               document.getElementById('edit-user-name').value = u.name;
               document.getElementById('edit-user-total-reqs').value = u.limitTotalReq? (u.limitTotalReq / 6000).toFixed(2): '';
               document.getElementById('edit-user-daily-reqs').value = u.limitDailyReq? (u.limitDailyReq / 6000).toFixed(2): '';
-              document.getElementById('edit-user-proxy-ip').value = u.proxyIp || '';
+                            const globalCleanIps = (window.nahanConfig?.cleanIps||"").split(/[\\r\\n,;]+/).map(s=>s.trim()).filter(Boolean);
+              const userCleanIps = (u.cleanIp || "").split(/[\\r\\n,;]+/).map(s=>s.trim()).filter(Boolean);
+              const checkedGlobalClean = [];
+              const customClean = [];
+              userCleanIps.forEach(ip => {
+                  let hostOnly = ip.split('#')[0].split(':')[0].trim();
+                  let isFound = globalCleanIps.some(g => g.split('#')[0].split(':')[0].trim() === hostOnly || g === ip);
+                  if (isFound) checkedGlobalClean.push(ip);
+                  else customClean.push(ip);
+              });
+              buildIPCheckboxes("edit-user-clean-ips-wrap", checkedGlobalClean.join(','), globalCleanIps);
+              document.getElementById('edit-user-custom-clean').value = customClean.join(', ');
+
+              const globalProxyIps = (window.nahanConfig?.backupRelay||"").split(/[\\r\\n,;]+/).map(s=>s.trim()).filter(Boolean);
+              const userProxyIps = (u.proxyIp || "").split(/[\\r\\n,;]+/).map(s=>s.trim()).filter(Boolean);
+              const checkedGlobalProxy = [];
+              const customProxy = [];
+              userProxyIps.forEach(ip => {
+                  let hostOnly = ip.split('#')[0].split(':')[0].trim();
+                  let isFound = globalProxyIps.some(g => g.split('#')[0].split(':')[0].trim() === hostOnly || g === ip);
+                  if (isFound) checkedGlobalProxy.push(ip);
+                  else customProxy.push(ip);
+              });
+               buildIPCheckboxes("edit-user-proxy-ips-wrap", checkedGlobalProxy.join(','), globalProxyIps);
+               document.getElementById('edit-user-custom-proxy').value = customProxy.join(', ');
+
+               const globalNodes = (window.nahanConfig?.slaveNodes||"").split(/[\\r\\n,;]+/).map(s=>s.trim()).filter(Boolean);
+               const userNodesList = (u.userNodes || "").split(/[\\r\\n,;]+/).map(s=>s.trim()).filter(Boolean);
+               const checkedGlobalNodes = [];
+               const customNodes = [];
+               userNodesList.forEach(node => {
+                   let isFound = globalNodes.some(g => g === node);
+                   if (isFound) checkedGlobalNodes.push(node);
+                   else customNodes.push(node);
+               });
+               buildNodeCheckboxes("edit-user-nodes-wrap", checkedGlobalNodes.join(','), globalNodes);
+               document.getElementById('edit-user-custom-nodes').value = customNodes.join(', ');
+               document.getElementById('edit-user-nat64').value = u.nat64 || '';
+
+               document.getElementById('edit-user-custom-name').value = u.customName || '';
+              
               document.getElementById('edit-user-max-configs').value = u.maxConfigs || '';
               
               buildPortCheckboxes('edit-user-ports-wrap', u.userPorts);
@@ -5918,13 +8174,37 @@ function getDashboardUI(hasDB) {
               let dReq = document.getElementById('edit-user-daily-reqs').value;
               dReq = dReq? Math.floor(parseFloat(dReq) * 6000): null;
               let days = document.getElementById('edit-user-days').value;
-              const proxyIp = document.getElementById('edit-user-proxy-ip').value || null;
+                             const proxyIpsCheckbox = getSelectedCheckboxes("edit-user-proxy-ips-wrap");
+               const proxyIpsCustom = document.getElementById("edit-user-custom-proxy").value.trim();
+               let proxyIpArray = [];
+               if (proxyIpsCheckbox) proxyIpArray.push(...proxyIpsCheckbox.split(','));
+               if (proxyIpsCustom) {
+                   proxyIpArray.push(...proxyIpsCustom.split(/[\\s,;]+/).map(s=>s.trim()).filter(Boolean));
+               }
+               const proxyIp = proxyIpArray.length ? proxyIpArray.join(',') : null;
+               
+               const customName = document.getElementById('edit-user-custom-name').value.trim() || null;
+               const cleanIpsCheckbox = getSelectedCheckboxes("edit-user-clean-ips-wrap");
+               const cleanIpsCustom = document.getElementById("edit-user-custom-clean").value.trim();
+               let cleanIpArray = [];
+               if (cleanIpsCheckbox) cleanIpArray.push(...cleanIpsCheckbox.split(','));
+               if (cleanIpsCustom) {
+                   cleanIpArray.push(...cleanIpsCustom.split(/[\\s,;]+/).map(s=>s.trim()).filter(Boolean));
+               }
+               const cleanIp = cleanIpArray.length ? cleanIpArray.join(',') : null;
               const userMode = readModeFromCheckboxes('edit-mode-cb');
               const userPorts = readPortsFromCheckboxes('edit-user-ports-wrap');
-              let maxConfigs = document.getElementById('edit-user-max-configs').value;
-              maxConfigs = maxConfigs ? parseInt(maxConfigs) : null;
-              
-              if(!name) {
+               let maxConfigs = document.getElementById('edit-user-max-configs').value;
+               maxConfigs = maxConfigs ? parseInt(maxConfigs) : null;
+               const nodesCheckbox = getSelectedCheckboxes("edit-user-nodes-wrap");
+               const nodesCustom = document.getElementById("edit-user-custom-nodes").value.trim();
+               let nodesArray = [];
+               if (nodesCheckbox) nodesArray.push(...nodesCheckbox.split(','));
+               if (nodesCustom) nodesArray.push(...nodesCustom.split(/[\\s,;]+/).map(s=>s.trim()).filter(Boolean));
+               const userNodes = nodesArray.length ? nodesArray.join(',') : null;
+               const nat64 = document.getElementById('add-user-nat64').value.trim() || null;
+               
+               if(!name) {
                   alert(lang === 'fa' ? 'لطفاً نام را وارد کنید' : 'Please enter a name');
                   return;
               }
@@ -5947,9 +8227,13 @@ function getDashboardUI(hasDB) {
               u.limitDailyReq = dReq;
               u.expiryMs = days ? Date.now() + days*86400000 : null;
               u.proxyIp = proxyIp;
+               u.cleanIp = cleanIp;
+               u.customName = customName;
               u.userMode = userMode;
               u.userPorts = userPorts;
               u.maxConfigs = maxConfigs;
+              u.userNodes = userNodes;
+              u.nat64 = nat64;
               
               document.getElementById('modal-edit-user').classList.add('hidden');
               renderUsersTable();
@@ -5974,58 +8258,217 @@ function getDashboardUI(hasDB) {
               btn.innerText = origText;
           }
 
-          async function checkUpdate() {
-              let repo = document.getElementById('cfg-github-repo')?.value || window.nahanConfig?.githubRepo || 'itsyebekhe/nahan';
-              repo = repo.replace(/https:\\/\\/github\\.com\\//, '').trim();
-              if (!repo) return;
+          async function resolveSmartCleanIps() {
+              const btn = document.getElementById('btn-resolve-smart-ips');
+              const origText = btn.innerHTML;
+              btn.disabled = true;
+              btn.innerHTML = '⚡ Resolving CDN & Clean IPs...';
+              
+              const domains = [
+                  'www.speedtest.net',
+                  'grok.com',
+                  'feedback.spotify.com',
+                  'www.hcaptcha.com',
+                  'chatgpt.com',
+                  'sourceforge.net',
+                  'snapp.ir',
+                  'digikala.com',
+                  'divar.ir',
+                  'cafebazaar.ir',
+                  'shaparak.ir',
+                  'aparat.com',
+                  'soft98.ir',
+                  'varzesh3.com'
+              ];
+              
+              let resolvedIps = new Set();
+              const cleanIpsTextarea = document.getElementById('cfg-ips');
+              
+              async function resolveOne(domain) {
+                  try {
+                      const res = await fetch(\`https://cloudflare-dns.com/dns-query?name=\${encodeURIComponent(domain)}&type=A\`, { 
+                          headers: { 'accept': 'application/dns-json' }
+                      });
+                      const data = await res.json();
+                      if (data && data.Answer) {
+                          data.Answer.forEach(ans => {
+                              if (ans.type === 1 && ans.data) {
+                                  resolvedIps.add(ans.data);
+                              }
+                          });
+                      }
+                  } catch(e) {
+                      try {
+                          const res = await fetch(\`https://dns.google/resolve?name=\${encodeURIComponent(domain)}&type=A\`);
+                          const data = await res.json();
+                          if (data && data.Answer) {
+                              data.Answer.forEach(ans => {
+                                  if (ans.type === 1 && ans.data) {
+                                      resolvedIps.add(ans.data);
+                                  }
+                              });
+                          }
+                      } catch(ge) {}
+                  }
+              }
               
               try {
-                  let remoteVer = null;
-                  try {
-                      const res = await fetch('https://raw.githubusercontent.com/' + repo + '/main/version');
-                      if (res.ok) {
-                          const txt = await res.text();
-                          if (txt && txt.trim().length <= 15) {
-                              remoteVer = txt.trim();
-                          }
-                      }
-                  } catch(e) {}
-                  
-                  if (!remoteVer) {
-                      const res = await fetch('https://raw.githubusercontent.com/' + repo + '/main/worker.js');
-                      if (res.ok) {
-                          const code = await res.text();
-                          const match = code.match(/const\\s+CURRENT_VERSION\\s*=\\s*["\']([^"\']+)["\']/);
-                          if (match && match[1]) {
-                              remoteVer = match[1];
-                          }
+                  await Promise.all(domains.map(d => resolveOne(d)));
+              } catch(err) {
+                  console.error("DNS resolving process encountered an issue:", err);
+              }
+              
+              if (resolvedIps.size > 0) {
+                  const ipList = Array.from(resolvedIps).join('\\n');
+                  cleanIpsTextarea.value = ipList;
+                  cleanIpsTextarea.dispatchEvent(new Event('input'));
+                  cleanIpsTextarea.dispatchEvent(new Event('change'));
+                  alert((lang === 'fa' ? 'با موفقیت حل شد و ' : 'Successfully resolved and loaded ') + resolvedIps.size + (lang === 'fa' ? ' آی‌پی تمیز بارگذاری شد!' : ' clean IPs!'));
+              } else {
+                  alert(lang === 'fa' ? 'خطا در تبدیل دامنه به آی‌پی. لطفاً اتصال اینترنت یا DNS سفارشی خود را بررسی کنید.' : 'Failed to resolve domains to IPs. Please verify your internet connection or custom DNS.');
+              }
+              
+              btn.disabled = false;
+              btn.innerHTML = origText;
+          }
+
+          async function checkUpdate() {
+              try {
+                  const res = await fetch(baseRoute + '/api/update', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ key: sessionKey, action: 'check' })
+                  });
+                  const data = await res.json();
+                  if (data.success && data.updateAvailable) {
+                      window._updateData = data;
+                      if (window.nahanConfig?.autoUpdate && data.canDeploy) {
+                          const format = window.nahanConfig.autoUpdateFormat || 'normal';
+                          const formatEl = document.querySelector(\`input[name="auto-update-format"][value="\${format}"]\`);
+                          if (formatEl) formatEl.checked = true;
+                          const autoRadio = document.querySelector(\`input[name="auto-update-format"][value="\${format}"]\`);
+                          if (autoRadio) autoRadio.checked = true;
+                          doUpdate();
+                      } else {
+                          showUpdateBanner((document.getElementById('cfg-github-repo')?.value || window.nahanConfig?.githubRepo || 'itsyebekhe/nahan').replace('https://github.com/', '').replace('http://github.com/', '').trim(), data.latest);
                       }
                   }
-                  
-                if (remoteVer) {
-                    const strip = v => v.replace(/^v/, '').trim();
-                    const rVer = strip(remoteVer);
-                    const cVer = strip(CURRENT_VERSION);
-                    
-                    const cmpVersions = (a, b) => {
-                        const pa = a.split('.').map(Number);
-                        const pb = b.split('.').map(Number);
-                        for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-                            let na = pa[i] || 0;
-                            let nb = pb[i] || 0;
-                            if (na > nb) return 1;
-                            if (nb > na) return -1;
-                        }
-                        return 0;
-                    };
-                    
-                    if (cmpVersions(cVer, rVer) < 0) {
-                        showUpdateBanner(repo, rVer);
-                    }
-                }
+                  if (data.success && !data.canDeploy) {
+                      const statusEl = document.getElementById('update-deploy-status');
+                      if (statusEl) {
+                          statusEl.classList.remove('hidden');
+                          statusEl.className = 'w-full mt-3 p-3 rounded-xl text-sm font-bold text-center text-amber-600 bg-amber-50 dark:bg-amber-900/20 dark:text-amber-400';
+                          statusEl.textContent = i18n[lang].update_requires_cf || 'Configure CF credentials to enable auto-deploy.';
+                      }
+                  }
               } catch(err) {
                   console.error("Update check failed:", err);
               }
+          }
+
+          async function doUpdate() {
+              const btn = document.getElementById('update-deploy-btn');
+              const statusEl = document.getElementById('update-deploy-status');
+              if (!btn) return;
+              if (!confirm(lang === 'fa' ? 'آیا از دپلوی نسخه فعلی/جدید اطمینان دارید؟' : 'Deploy the selected version now?')) return;
+
+              const formatEl = document.querySelector('input[name="update-format"]:checked');
+              const format = formatEl ? formatEl.value : 'normal';
+              const forceDeploy = !window._updateData?.updateAvailable;
+
+              const origText = btn.innerHTML;
+              btn.innerHTML = '⏳ ' + (i18n[lang].update_deploying || 'Deploying...');
+              btn.disabled = true;
+              if (statusEl) {
+                  statusEl.classList.remove('hidden');
+                  statusEl.className = 'w-full mt-3 p-3 rounded-xl text-sm font-bold text-center text-blue-600 bg-blue-50 dark:bg-blue-900/20 dark:text-blue-400 animate-pulse';
+                  statusEl.textContent = i18n[lang].update_deploying || 'Deploying update...';
+              }
+
+              let latestCode = null;
+              try {
+                  const repo = (document.getElementById('cfg-github-repo')?.value || window.nahanConfig?.githubRepo || 'itsyebekhe/nahan').replace('https://github.com/', '').replace('http://github.com/', '').trim();
+                  if (statusEl) statusEl.textContent = '📥 ' + (lang === 'fa' ? 'در حال دریافت کد از مخزن گیت‌هاب...' : 'Fetching latest code from GitHub...');
+                  const fetchRes = await fetch('https://raw.githubusercontent.com/' + repo + '/main/_worker.js');
+                  if (!fetchRes.ok) throw new Error('HTTP ' + fetchRes.status);
+                  latestCode = await fetchRes.text();
+              } catch(fe) {
+                  console.warn("Client fetch failed, falling back to server-side fetch", fe);
+              }
+
+              if (latestCode && format === 'obfuscated') {
+                  if (statusEl) statusEl.textContent = '🛡️ ' + (lang === 'fa' ? 'در حال اجرای مبهم‌سازی کلاینت...' : 'Applying client-side XOR obfuscation...');
+                  try {
+                      latestCode = obfuscateCode(latestCode);
+                  } catch(oe) {
+                      if (statusEl) {
+                          statusEl.className = 'w-full mt-3 p-3 rounded-xl text-sm font-bold text-center text-red-600 bg-red-50 dark:bg-red-900/20 dark:text-red-400';
+                          statusEl.textContent = 'Obfuscation failed: ' + oe.message;
+                      }
+                      btn.innerHTML = origText;
+                      btn.disabled = false;
+                      return;
+                  }
+              }
+
+              try {
+                  const res = await fetch(baseRoute + '/api/update', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ 
+                          key: sessionKey, 
+                          action: 'deploy',
+                          code: latestCode,
+                          force: forceDeploy
+                      })
+                  });
+                  const data = await res.json();
+                  if (data.success) {
+                      if (statusEl) {
+                          statusEl.className = 'w-full mt-3 p-3 rounded-xl text-sm font-bold text-center text-emerald-600 bg-emerald-50 dark:bg-emerald-900/20 dark:text-emerald-400';
+                          statusEl.textContent = (i18n[lang].update_success || 'Update successful!') + ' v' + data.newVersion;
+                      }
+                      btn.innerHTML = '✅ ' + (i18n[lang].update_success || 'Done!');
+                      setTimeout(() => window.location.reload(), 3000);
+                  } else {
+                      if (statusEl) {
+                          statusEl.className = 'w-full mt-3 p-3 rounded-xl text-sm font-bold text-center text-red-600 bg-red-50 dark:bg-red-900/20 dark:text-red-400';
+                          statusEl.textContent = (i18n[lang].update_error || 'Update failed') + ': ' + (data.error || 'Unknown error');
+                      }
+                      btn.innerHTML = origText;
+                      btn.disabled = false;
+                  }
+              } catch(e) {
+                  if (statusEl) {
+                      statusEl.className = 'w-full mt-3 p-3 rounded-xl text-sm font-bold text-center text-red-600 bg-red-50 dark:bg-red-900/20 dark:text-red-400';
+                      statusEl.textContent = 'Error: ' + e.message;
+                  }
+                  btn.innerHTML = origText;
+                  btn.disabled = false;
+              }
+          }
+
+          async function triggerManualRedeploy() {
+              const banner = document.getElementById('update-alert-banner');
+              if (!banner) return;
+              
+              document.getElementById('update-alert-text').textContent = lang === 'fa' 
+                  ? 'می‌توانید آخرین نسخه فعال را مجدداً دپلوی نموده یا بین نسخه معمولی و مبهم‌سازی شده جابجا شوید.'
+                  : 'You can redeploy the latest code or switch between Normal/Obfuscated version on the fly.';
+              
+              banner.classList.remove('hidden');
+              banner.classList.add('flex');
+              
+              if (!window._updateData) {
+                  window._updateData = { latest: CURRENT_VERSION, updateAvailable: false };
+              }
+              
+              const repo = (document.getElementById('cfg-github-repo')?.value || window.nahanConfig?.githubRepo || 'itsyebekhe/nahan').replace('https://github.com/', '').replace('http://github.com/', '').trim();
+              
+              showUpdateBanner(repo, CURRENT_VERSION);
+              
+              switchTab('overview');
+              document.getElementById('update-alert-banner').scrollIntoView({ behavior: 'smooth' });
           }
           
           function parseMarkdown(md) {
@@ -6034,9 +8477,31 @@ function getDashboardUI(hasDB) {
               let htmlLines = [];
               let inCodeBlock = false;
               let codeContent = [];
+              let activeBlockLang = null;
 
               for (let line of lines) {
                   let trimmed = line.trim();
+
+                  if (trimmed === '<!-- LANG:EN -->' || trimmed === '<!--LANG:EN-->') {
+                      if (activeBlockLang === 'en') {
+                          activeBlockLang = null;
+                      } else {
+                          activeBlockLang = 'en';
+                      }
+                      continue;
+                  }
+                  if (trimmed === '<!-- LANG:FA -->' || trimmed === '<!--LANG:FA-->') {
+                      if (activeBlockLang === 'fa') {
+                          activeBlockLang = null;
+                      } else {
+                          activeBlockLang = 'fa';
+                      }
+                      continue;
+                  }
+
+                  if (activeBlockLang !== null && activeBlockLang !== lang) {
+                      continue;
+                  }
 
                   // Toggle code block
                   if (trimmed.startsWith('\\x60\\x60\\x60')) {
@@ -6128,7 +8593,8 @@ function getDashboardUI(hasDB) {
                   : 'A newer version (v' + version + ') is available in your GitHub repository (' + repo + ').';
                   
               document.getElementById('update-alert-text').textContent = msg;
-              document.getElementById('update-alert-btn').href = 'https://github.com/' + repo;
+              const ghLink = document.getElementById('update-github-link');
+              if (ghLink) ghLink.href = 'https://github.com/' + repo;
               banner.classList.remove('hidden');
               banner.classList.add('flex');
               
@@ -6185,8 +8651,44 @@ function getDashboardUI(hasDB) {
                           changelogContent.innerHTML = parseMarkdown(changelogText);
                       } else {
                           changelogContent.innerHTML = lang === 'fa' 
-                              ? '<p class="text-slate-500">گزارش تغییراتی برای این نسخه یافت نشد.</p>' 
-                              : '<p class="text-slate-500">No changelog registered for this version.</p>';
+                              ? '<div class="space-y-2">' +
+                                '<p class="font-bold">✨ اضافه شده:</p>' +
+                                '<ul class="list-disc list-inside text-xs space-y-1">' +
+                                '<li>صفحه اشتراک چندزبانه با حالت تاریک/روشن</li>' +
+                                '<li>پشتیبانی NAT64 و نودهای اختصاصی کاربر</li>' +
+                                '<li>کانفیگ‌های مستقیم و بروزرسانی خودکار</li>' +
+                                '<li>مدیریت کامل دروازه از ربات تلگرام</li>' +
+                                '</ul>' +
+                                '<p class="font-bold mt-2">⚡ بهبود یافته:</p>' +
+                                '<ul class="list-disc list-inside text-xs space-y-1">' +
+                                '<li>عملکرد داشبورد و سرعت اسکرول</li>' +
+                                '<li>بازنویسی کامل تولید کانفیگ‌ها</li>' +
+                                '<li>نام‌گذاری هوشمند با تگ‌های جدید</li>' +
+                                '</ul>' +
+                                '<p class="font-bold mt-2">🔧 رفع شده:</p>' +
+                                '<ul class="list-disc list-inside text-xs space-y-1">' +
+                                '<li>ترجمه‌های فارسی معیوب</li>' +
+                                '<li>خطای صفحه اشتراک</li>' +
+                                '</ul></div>'
+                              : '<div class="space-y-2">' +
+                                '<p class="font-bold">✨ Added:</p>' +
+                                '<ul class="list-disc list-inside text-xs space-y-1">' +
+                                '<li>Bilingual subscription page with dark/light mode</li>' +
+                                '<li>NAT64 support and per-user custom nodes</li>' +
+                                '<li>Direct configs and auto update</li>' +
+                                '<li>Full gateway management via Telegram bot</li>' +
+                                '</ul>' +
+                                '<p class="font-bold mt-2">⚡ Improved:</p>' +
+                                '<ul class="list-disc list-inside text-xs space-y-1">' +
+                                '<li>Dashboard performance and scroll speed</li>' +
+                                '<li>Complete rewrite of all config generators</li>' +
+                                '<li>Smart config naming with new tags</li>' +
+                                '</ul>' +
+                                '<p class="font-bold mt-2">🔧 Fixed:</p>' +
+                                '<ul class="list-disc list-inside text-xs space-y-1">' +
+                                '<li>Garbled Persian translations</li>' +
+                                '<li>Subscription page display error</li>' +
+                                '</ul></div>';
                       }
                   } catch(err) {
                       changelogContent.innerHTML = lang === 'fa' 
@@ -6196,10 +8698,7 @@ function getDashboardUI(hasDB) {
               }
           }
           //DateTime Function
-            function updatePersianDateTime() {
-    const now = new Date();
-
-    const formatter = new Intl.DateTimeFormat('fa-IR', {
+            const _dtFormatter = new Intl.DateTimeFormat('fa-IR', {
         year: 'numeric',
         month: 'long',
         day: 'numeric',
@@ -6207,8 +8706,9 @@ function getDashboardUI(hasDB) {
         minute: '2-digit',
         second: '2-digit'
     });
-
-    const parts = formatter.formatToParts(now);
+            function updatePersianDateTime() {
+    const now = new Date();
+    const parts = _dtFormatter.formatToParts(now);
 
     const map = {};
     parts.forEach(p => {
@@ -6232,7 +8732,7 @@ function getDashboardUI(hasDB) {
               const b = document.getElementById('update-alert-banner');
               if (b) {
                   b.classList.remove('flex');
-                  b.classList.add('hidden');
+                  b.classList.add('hidden'); 
               }
           }
 
