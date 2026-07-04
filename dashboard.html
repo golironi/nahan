@@ -12,7 +12,7 @@
       <title>Nahan Gateway</title>
       <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;700;900&amp;display=swap" rel="stylesheet">
       <script src="https://cdn.tailwindcss.com"></script>
-      <script>
+            <script>
           tailwind.config = {
     darkMode: 'class',
     theme: {
@@ -28,16 +28,16 @@
                 white: '#ffffff',
                 black: '#000',
                 slate: {
-                    50: 'var(--color-bg-alt)',
-                    100: 'var(--color-border)',
-                    200: 'var(--color-border)',
-                    300: 'var(--color-text-muted)',
-                    400: 'var(--color-text-muted)',
-                    500: 'var(--color-text-muted)',
-                    600: 'var(--color-text-muted)',
-                    700: 'var(--color-text)',
-                    800: 'var(--color-text)',
-                    900: 'var(--color-text)',
+                    50: 'var(--slate-50)',
+                    100: 'var(--slate-100)',
+                    200: 'var(--slate-200)',
+                    300: 'var(--slate-300)',
+                    400: 'var(--slate-400)',
+                    500: 'var(--slate-500)',
+                    600: 'var(--slate-600)',
+                    700: 'var(--slate-700)',
+                    800: 'var(--slate-800)',
+                    900: 'var(--slate-900)',
                 }
             }
         }
@@ -49,28 +49,189 @@
 :root {
     --color-text: #0f172a;
     --color-text-muted: #475569;
-    --color-primary: #6366f1; --color-primary-hover: #4f46e5; --color-bg: #f8fafc;
-    --color-surface: rgba(255, 255, 255, 0.7); --color-border: rgba(203, 213, 225, 0.5);
-    --color-bg-alt: #f1f5f9;
+    --color-primary: #6366f1; --color-primary-hover: #4f46e5;
+    --color-bg: var(--slate-50);
+    --color-surface: #ffffff;
+    --color-bg-alt: var(--slate-100);
+    --color-border: var(--slate-200);
+
+    /* Light Mode slate mappings */
+    --slate-50: #f8fafc;
+    --slate-100: #f1f5f9;
+    --slate-200: #e2e8f0;
+    --slate-300: #cbd5e1;
+    --slate-400: #94a3b8;
+    --slate-500: #64748b;
+    --slate-600: #475569;
+    --slate-700: #334155;
+    --slate-800: #1e293b;
+    --slate-900: #0f172a;
 }
 html.dark {
     --color-text: #f1f5f9;
     --color-text-muted: #cbd5e1;
-    --color-primary: #818cf8; --color-primary-hover: #6366f1; --color-bg: #0f172a;
-    --color-surface: rgba(30, 41, 59, 0.6); --color-border: rgba(51, 65, 85, 0.5);
-    --color-bg-alt: #1e293b;
+    --color-primary: #818cf8; --color-primary-hover: #6366f1;
+    --color-bg: var(--slate-900);
+    --color-surface: var(--slate-800);
+    --color-bg-alt: var(--slate-100);
+    --color-border: var(--slate-200);
+
+    /* Dark Mode slate mappings */
+    --slate-50: #090d16;
+    --slate-100: #151b26;
+    --slate-200: #222b3c;
+    --slate-300: #cbd5e1;
+    --slate-400: #94a3b8;
+    --slate-500: #64748b;
+    --slate-600: #475569;
+    --slate-700: #cbd5e1;
+    --slate-800: #0f172a;
+    --slate-900: #090d16;
 }
 /* Ocean Theme */
-html[data-theme="ocean"] { --color-primary: #0ea5e9; --color-bg: #e0f2fe; --color-surface: rgba(255,255,255,0.7); --color-bg-alt: rgba(255,255,255,0.5); --color-border: rgba(14, 165, 233, 0.2); --color-text: #082f49; }
-html[data-theme="ocean"].dark { --color-primary: #38bdf8; --color-bg: #082f49; --color-surface: rgba(12, 74, 110, 0.7); --color-bg-alt: rgba(12, 74, 110, 0.5); --color-border: rgba(56, 189, 248, 0.2); --color-text: #e0f2fe; }
+html[data-theme="ocean"] {
+    --color-primary: #0ea5e9;
+    --color-bg: var(--slate-50);
+    --color-surface: #ffffff;
+    --color-bg-alt: var(--slate-100);
+    --color-border: var(--slate-200);
+    --color-text: #082f49;
+    --color-text-muted: #0369a1;
+
+    --slate-50: #f0f9ff;
+    --slate-100: #e0f2fe;
+    --slate-200: #bae6fd;
+    --slate-300: #7dd3fc;
+    --slate-400: #38bdf8;
+    --slate-500: #0ea5e9;
+    --slate-600: #0284c7;
+    --slate-700: #0369a1;
+    --slate-800: #075985;
+    --slate-900: #0c4a6e;
+}
+html[data-theme="ocean"].dark {
+    --color-primary: #38bdf8;
+    --color-bg: var(--slate-900);
+    --color-surface: var(--slate-800);
+    --color-bg-alt: var(--slate-100);
+    --color-border: var(--slate-200);
+    --color-text: #e0f2fe;
+    --color-text-muted: #7dd3fc;
+
+    --slate-50: #031e30;
+    --slate-100: #072f49;
+    --slate-200: #0c4a6e;
+    --slate-300: #bae6fd;
+    --slate-400: #7dd3fc;
+    --slate-500: #38bdf8;
+    --slate-600: #0ea5e9;
+    --slate-700: #bae6fd;
+    --slate-800: #072f49;
+    --slate-900: #031e30;
+}
 /* Forest Theme */
-html[data-theme="forest"] { --color-primary: #10b981; --color-bg: #dcfce7; --color-surface: rgba(255,255,255,0.7); --color-bg-alt: rgba(255,255,255,0.5); --color-border: rgba(16, 185, 129, 0.2); --color-text: #022c22; }
-html[data-theme="forest"].dark { --color-primary: #34d399; --color-bg: #022c22; --color-surface: rgba(6, 78, 59, 0.7); --color-bg-alt: rgba(6, 78, 59, 0.5); --color-border: rgba(52, 211, 153, 0.2); --color-text: #dcfce7; }
+html[data-theme="forest"] {
+    --color-primary: #10b981;
+    --color-bg: var(--slate-50);
+    --color-surface: #ffffff;
+    --color-bg-alt: var(--slate-100);
+    --color-border: var(--slate-200);
+    --color-text: #022c22;
+    --color-text-muted: #15803d;
+
+    --slate-50: #f0fdf4;
+    --slate-100: #dcfce7;
+    --slate-200: #bbf7d0;
+    --slate-300: #86efac;
+    --slate-400: #4ade80;
+    --slate-500: #22c55e;
+    --slate-600: #16a34a;
+    --slate-700: #15803d;
+    --slate-800: #166534;
+    --slate-900: #14532d;
+}
+html[data-theme="forest"].dark {
+    --color-primary: #34d399;
+    --color-bg: var(--slate-900);
+    --color-surface: var(--slate-800);
+    --color-bg-alt: var(--slate-100);
+    --color-border: var(--slate-200);
+    --color-text: #dcfce7;
+    --color-text-muted: #86efac;
+
+    --slate-50: #021a11;
+    --slate-100: #042f1d;
+    --slate-200: #064e3b;
+    --slate-300: #bbf7d0;
+    --slate-400: #86efac;
+    --slate-500: #4ade80;
+    --slate-600: #22c55e;
+    --slate-700: #bbf7d0;
+    --slate-800: #042f1d;
+    --slate-900: #021a11;
+}
 /* Sunset Theme */
-html[data-theme="sunset"] { --color-primary: #f43f5e; --color-bg: #ffe4e6; --color-surface: rgba(255,255,255,0.7); --color-bg-alt: rgba(255,255,255,0.5); --color-border: rgba(244, 63, 94, 0.2); --color-text: #4c0519; }
-html[data-theme="sunset"].dark { --color-primary: #fb7185; --color-bg: #4c0519; --color-surface: rgba(136, 19, 55, 0.7); --color-bg-alt: rgba(136, 19, 55, 0.5); --color-border: rgba(251, 113, 133, 0.2); --color-text: #ffe4e6; }
+html[data-theme="sunset"] {
+    --color-primary: #f43f5e;
+    --color-bg: var(--slate-50);
+    --color-surface: #ffffff;
+    --color-bg-alt: var(--slate-100);
+    --color-border: var(--slate-200);
+    --color-text: #4c0519;
+    --color-text-muted: #e03131;
+
+    --slate-50: #fff5f5;
+    --slate-100: #ffe3e3;
+    --slate-200: #ffc9c9;
+    --slate-300: #ffa8a8;
+    --slate-400: #ff8787;
+    --slate-500: #ff6b6b;
+    --slate-600: #fa5252;
+    --slate-700: #e03131;
+    --slate-800: #c92a2a;
+    --slate-900: #4c0519;
+}
+html[data-theme="sunset"].dark {
+    --color-primary: #fb7185;
+    --color-bg: var(--slate-900);
+    --color-surface: var(--slate-800);
+    --color-bg-alt: var(--slate-100);
+    --color-border: var(--slate-200);
+    --color-text: #ffe4e6;
+    --color-text-muted: #ffa8a8;
+
+    --slate-50: #1f030a;
+    --slate-100: #3b0713;
+    --slate-200: #5c091f;
+    --slate-300: #ffc9c9;
+    --slate-400: #ffa8a8;
+    --slate-500: #ff8787;
+    --slate-600: #ff6b6b;
+    --slate-700: #ffc9c9;
+    --slate-800: #3b0713;
+    --slate-900: #1f030a;
+}
 /* Dracula Theme */
-html[data-theme="dracula"] { --color-primary: #bd93f9; --color-bg: #282a36; --color-surface: rgba(68, 71, 90, 0.6); --color-bg-alt: rgba(68, 71, 90, 0.4); --color-border: rgba(189, 147, 249, 0.2); --color-text: #f8f8f2; }
+html[data-theme="dracula"] {
+    --color-primary: #bd93f9;
+    --color-bg: var(--slate-900);
+    --color-surface: var(--slate-800);
+    --color-bg-alt: var(--slate-100);
+    --color-border: var(--slate-200);
+    --color-text: #f8f8f2;
+    --color-text-muted: #6272a4;
+
+    --slate-50: #1e1f29;
+    --slate-100: #282a36;
+    --slate-200: #44475a;
+    --slate-300: #f8f8f2;
+    --slate-400: #6272a4;
+    --slate-500: #bd93f9;
+    --slate-600: #ff79c6;
+    --slate-700: #f8f8f2;
+    --slate-800: #282a36;
+    --slate-900: #1e1f29;
+}
 
 html[lang="fa"] body, html[lang="fa"] body *:not(.font-mono) {
     font-family: 'Vazirmatn', sans-serif !important;
@@ -83,8 +244,32 @@ body {
     transition: background 0.3s ease, color 0.3s ease;
 }
 
-input, select, textarea { transition: all 0.2s; border-radius: 0.75rem !important; }
-input:focus, select:focus { border-color: var(--color-primary) !important; box-shadow: 0 0 0 2px rgba(var(--color-primary), 0.2) !important; }
+/* Perfect form styling with excellent contrast for every theme */
+input[type="text"]:not(.login-input), input[type="password"]:not(.login-input), select, textarea {
+    background-color: var(--slate-100) !important;
+    color: var(--slate-900) !important;
+    border-color: var(--slate-200) !important;
+    transition: all 0.2s;
+    border-radius: 0.75rem !important;
+}
+input[type="text"]:not(.login-input):focus, input[type="password"]:not(.login-input):focus, select:focus, textarea:focus {
+    border-color: var(--color-primary) !important;
+    box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.2) !important;
+}
+html.dark input[type="text"]:not(.login-input), html.dark input[type="password"]:not(.login-input), html.dark select, html.dark textarea {
+    background-color: var(--slate-100) !important;
+    color: var(--slate-300) !important;
+    border-color: var(--slate-200) !important;
+}
+select option {
+    background-color: var(--slate-50) !important;
+    color: var(--slate-900) !important;
+}
+html.dark select option {
+    background-color: var(--slate-100) !important;
+    color: var(--slate-300) !important;
+}
+
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--color-border); border-radius: 3px; }
